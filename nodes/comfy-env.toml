@@ -34,7 +34,9 @@ numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
 moge = { git = "https://github.com/microsoft/MoGe.git" }
-utils3d = { url = "https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl" }
+# Note: utils3d is NOT pinned here — MoGe brings in its own version transitively,
+# and the inference path (pixal3d.pipelines.Pixal3DImageTo3DPipeline + DinoV3ProjFeatureExtractor)
+# never imports utils3d directly. Pinning ours separately conflicts with MoGe's URL.
 natten = { url = "https://github.com/LDYang694/Storages/releases/download/20260430/natten-0.21.0+torch2.6cu124-cp310-cp310-linux_x86_64.whl" }
 
 [env_vars]
