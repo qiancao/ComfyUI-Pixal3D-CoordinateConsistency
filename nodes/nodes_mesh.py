@@ -203,6 +203,24 @@ class Pixal3DRasterizePBR(io.ComfyNode):
                     tooltip="Raw pre-simplification mesh (from Pixal3DGenerateMesh) for BVH-snap of texel positions. Improves sharpness."),
                 io.Boolean.Input("double_sided", default=False, optional=True,
                     tooltip="Mark the baked material as double-sided."),
+                io.Combo.Input(
+                    "bake_mode",
+                    options=["pbr", "xyz_position", "xyz_normal"],
+                    default="pbr",
+                    tooltip=(
+                        "What to bake into baseColorTexture.\n"
+                        "  pbr           - production: sample voxelgrid for base color + "
+                        "metallic/roughness/alpha (default).\n"
+                        "  xyz_position  - diagnostic: paint each texel with its mesh-frame "
+                        "(x, y, z) position as RGB. Red=+X, Green=+Y, Blue=+Z. Lets you SEE "
+                        "the mesh's axes on the model surface -- a flipped axis means the "
+                        "wrong channel gradients across the model.\n"
+                        "  xyz_normal    - diagnostic: paint each texel with its interpolated "
+                        "surface normal as RGB (normals in [-1,1] mapped to [0,1]). Lets you "
+                        "see face winding / normal direction issues."
+                    ),
+                    optional=True,
+                ),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="mesh"),
@@ -217,15 +235,17 @@ class Pixal3DRasterizePBR(io.ComfyNode):
         texture_size: int = 2048,
         original_mesh=None,
         double_sided: bool = False,
+        bake_mode: str = "pbr",
     ):
         from .stages import rasterize_pbr, _phase
-        with _phase("Pixal3DRasterizePBR.execute"):
+        with _phase(f"Pixal3DRasterizePBR.execute ({bake_mode})"):
             out = rasterize_pbr(
                 trimesh,
                 voxelgrid,
                 texture_size=texture_size,
                 original_mesh=original_mesh,
                 double_sided=double_sided,
+                bake_mode=bake_mode,
             )
             return io.NodeOutput(out)
 

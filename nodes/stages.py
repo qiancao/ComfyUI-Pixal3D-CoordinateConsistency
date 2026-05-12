@@ -950,7 +950,9 @@ def _bake_vertex_colors(tri, voxelgrid: dict, force_opaque: bool, double_sided: 
 
 def _rasterize_uv(vertices, faces, uvs, texture_size, device):
     """drtk port of nvdiffrast's UV-space rasterize+interpolate.
-    Returns (mask: [S,S] bool, valid_pos: [N, 3] float).
+    Returns (mask: [S,S] bool, valid_pos: [N, 3] float, face_ids: [N] long,
+             bary_masked: [N, 3] float) -- the extra outputs let callers
+    interpolate any per-vertex attribute (e.g. normals) without re-running drtk.
     Mirrors trellis2/nodes_unwrap.py:1026."""
     import drtk
     chunk_size = 100_000
@@ -977,9 +979,9 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device):
     face_ids = rast_face_ids[mask].long()
     face_verts = vertices[faces[face_ids].long()]
     valid_pos = (face_verts * bary_masked.unsqueeze(-1)).sum(dim=1)
-    del verts_uv, rast_face_ids, bary_img, bary, face_verts, bary_masked, face_ids
+    del verts_uv, rast_face_ids, bary_img, bary, face_verts
     comfy.model_management.soft_empty_cache()
-    return mask, valid_pos
+    return mask, valid_pos, face_ids, bary_masked
 
 
 def process_mesh(
@@ -1119,9 +1121,20 @@ def rasterize_pbr(
     texture_size: int = 2048,
     original_mesh=None,
     double_sided: bool = False,
+    bake_mode: str = "pbr",
 ):
     """drtk UV-space PBR bake. Port of TRELLIS2 Trellis2RasterizePBR.execute().
-    Returns a trimesh.Trimesh with a PBRMaterial(baseColorTexture, metallicRoughnessTexture)."""
+    Returns a trimesh.Trimesh with a PBRMaterial(baseColorTexture, metallicRoughnessTexture).
+
+    bake_mode:
+      'pbr'           -- bake baseColor + metallic/roughness/alpha from the voxel grid (production).
+      'xyz_position'  -- diagnostic: paint texels with (x, y, z) position as RGB.
+                         Maps the mesh's AABB into [0, 1]^3 so red=+X, green=+Y, blue=+Z.
+                         If the mesh is in Z-up working frame (post-GenerateMesh rotation),
+                         blue=Z will be the "up" axis on the rendered model.
+      'xyz_normal'    -- diagnostic: paint texels with the interpolated surface normal
+                         as RGB. Normals in [-1, 1] are mapped to [0, 1]. Lets you
+                         visually verify face winding / unify_face_orientations."""
     import cv2
     import cumesh as CuMesh
     from flex_gemm_ap.ops.grid_sample import grid_sample_3d
@@ -1157,7 +1170,7 @@ def rasterize_pbr(
     voxel_size_t = torch.tensor([voxel_size_v] * 3, dtype=torch.float32, device=device)
 
     with _phase("rasterize_pbr: drtk UV rasterize"):
-        mask, valid_pos = _rasterize_uv(vertices, faces, uvs, texture_size, device)
+        mask, valid_pos, face_ids, bary_masked = _rasterize_uv(vertices, faces, uvs, texture_size, device)
 
     if original_mesh is not None:
         with _phase("rasterize_pbr: BVH-snap texels to original mesh"):
@@ -1170,12 +1183,77 @@ def rasterize_pbr(
             del bvh, orig_v, orig_f, face_id, uvw, orig_tri_v
 
     comfy.model_management.soft_empty_cache()
+    mask_np = mask.cpu().numpy()
 
+    # --------------------------------------------------------------------
+    # Diagnostic bake modes: paint texels with mesh-frame XYZ position or
+    # interpolated surface normal as RGB. Skip the voxel sample entirely.
+    # --------------------------------------------------------------------
+    if bake_mode in ("xyz_position", "xyz_normal"):
+        with _phase(f"rasterize_pbr: {bake_mode} bake"):
+            if bake_mode == "xyz_position":
+                # Map mesh-frame valid_pos AABB into [0, 1]^3 so red=+X axis,
+                # green=+Y axis, blue=+Z axis on the textured model.
+                v_min = valid_pos.amin(dim=0)
+                v_max = valid_pos.amax(dim=0)
+                span = (v_max - v_min).clamp(min=1e-6)
+                rgb_vals = ((valid_pos - v_min) / span).clamp(0.0, 1.0)
+                log.info(
+                    f"[pixal3d] xyz_position: AABB min={v_min.tolist()}, "
+                    f"max={v_max.tolist()} (mapped to [0,1] RGB)"
+                )
+            else:  # xyz_normal
+                if not hasattr(tri, "vertex_normals") or tri.vertex_normals is None:
+                    raise ValueError(
+                        "rasterize_pbr xyz_normal: input mesh has no vertex_normals. "
+                        "Pixal3DProcessMesh should populate them."
+                    )
+                vnorm = torch.tensor(np.asarray(tri.vertex_normals), dtype=torch.float32, device=device)
+                per_vert_normals = vnorm[faces[face_ids].long()]  # [N_texel, 3, 3]
+                texel_normals = (per_vert_normals * bary_masked.unsqueeze(-1)).sum(dim=1)
+                texel_normals = torch.nn.functional.normalize(texel_normals, dim=-1)
+                rgb_vals = (texel_normals * 0.5 + 0.5).clamp(0.0, 1.0)
+                log.info("[pixal3d] xyz_normal: per-texel normal mapped from [-1,1] to [0,1] RGB")
+
+            rgb_img = torch.zeros(texture_size, texture_size, 3, device=device)
+            rgb_img[mask] = rgb_vals
+            base_color = np.clip(rgb_img.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+            del rgb_img, rgb_vals
+
+        with _phase("rasterize_pbr: cv2.inpaint (UV seam pad, diagnostic)"):
+            mask_inv = (~mask_np).astype(np.uint8)
+            base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+
+        # Build a fully opaque, unlit-ish material so the colors read clean.
+        alpha = np.full((texture_size, texture_size, 1), 255, dtype=np.uint8)
+        material = Trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+            alphaMode="OPAQUE",
+            doubleSided=double_sided,
+        )
+        result = Trimesh.Trimesh(
+            vertices=tri.vertices,
+            faces=tri.faces,
+            vertex_normals=tri.vertex_normals if hasattr(tri, "vertex_normals") else None,
+            process=False,
+            visual=Trimesh.visual.TextureVisuals(uv=tri.visual.uv, material=material),
+        )
+        log.info(f"[pixal3d] rasterize_pbr: {bake_mode} diagnostic texture baked ({texture_size}x{texture_size})")
+        del attr_volume, coords, mask, valid_pos, face_ids, bary_masked
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+        return result
+
+    # --------------------------------------------------------------------
+    # Production PBR bake.
+    # --------------------------------------------------------------------
     # Mesh + valid_pos are in Z-up (rotated by Pixal3DGenerateMesh to match
     # TRELLIS2's verified-working cumesh/drtk regime). The voxelgrid is left
-    # in cascade-native Y-up (rotating a sparse integer voxel grid is harder
-    # and unnecessary). Rotate valid_pos Z-up -> Y-up just for the sparse
-    # voxel sample so it lines up with the voxelgrid's frame.
+    # in cascade-native Y-up. Rotate valid_pos Z-up -> Y-up via column swap
+    # so it lines up with the voxelgrid's frame.
     valid_pos_yup = torch.stack(
         [valid_pos[:, 0], valid_pos[:, 2], -valid_pos[:, 1]],
         dim=-1,
@@ -1192,10 +1270,9 @@ def rasterize_pbr(
             mode="trilinear",
         )
 
-    del valid_pos
+    del valid_pos, valid_pos_yup, face_ids, bary_masked
     comfy.model_management.soft_empty_cache()
 
-    mask_np = mask.cpu().numpy()
     bc_slice = layout.get("base_color", slice(0, 3))
     me_slice = layout.get("metallic", slice(3, 4))
     ro_slice = layout.get("roughness", slice(4, 5))
