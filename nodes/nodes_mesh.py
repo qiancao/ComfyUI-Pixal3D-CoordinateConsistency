@@ -72,7 +72,7 @@ class Pixal3DGenerateMesh(io.ComfyNode):
         shape_steps: int = 12, shape_guidance: float = 7.5, shape_rescale: float = 0.5, shape_rescale_t: float = 3.0,
         tex_steps: int = 12, tex_guidance: float = 1.0, tex_rescale: float = 0.0, tex_rescale_t: float = 3.0,
     ):
-        from .stages import generate_mesh_and_voxelgrid, _phase
+        from .stages import generate_mesh_and_voxelgrid, _YUP_TO_ZUP_ROT, _phase
         with _phase("Pixal3DGenerateMesh.execute"):
             tri, voxelgrid = generate_mesh_and_voxelgrid(
                 image=image,
@@ -85,9 +85,16 @@ class Pixal3DGenerateMesh(io.ComfyNode):
                 shape_steps=shape_steps, shape_guidance=shape_guidance, shape_rescale=shape_rescale, shape_rescale_t=shape_rescale_t,
                 tex_steps=tex_steps, tex_guidance=tex_guidance, tex_rescale=tex_rescale, tex_rescale_t=tex_rescale_t,
             )
+            # Pixal3D's cascade outputs Y-up natively; TRELLIS2's verified-working
+            # cumesh+drtk UV-bake regime expects Z-up. Rotate here so ProcessMesh /
+            # RasterizePBR see the same frame TRELLIS2 was tested on; ExportGLB
+            # rotates back to Y-up for the final GLB. Voxelgrid stays Y-up;
+            # rasterize_pbr rotates valid_pos back to Y-up for the voxel sample.
+            tri.apply_transform(_YUP_TO_ZUP_ROT)
             log.info(
                 f"[Pixal3DGenerateMesh] mesh={len(tri.vertices)} verts / {len(tri.faces)} faces, "
-                f"voxelgrid={voxelgrid['attrs'].shape[0]} voxels x{voxelgrid['attrs'].shape[1]} attrs"
+                f"voxelgrid={voxelgrid['attrs'].shape[0]} voxels x{voxelgrid['attrs'].shape[1]} attrs "
+                f"(mesh rotated Y-up -> Z-up for downstream bake)"
             )
             return io.NodeOutput(tri, voxelgrid)
 
@@ -249,9 +256,11 @@ class Pixal3DExportGLB(io.ComfyNode):
 
     @classmethod
     def execute(cls, trimesh, filename_prefix: str = "pixal3d"):
-        from .stages import export_glb, _phase
+        from .stages import export_glb_yup, _phase
         with _phase("Pixal3DExportGLB.execute"):
-            path = export_glb(trimesh, filename_prefix=filename_prefix)
+            # ProcessMesh + RasterizePBR run in a Z-up working frame; rotate
+            # back to glTF Y-up here for the final file.
+            path = export_glb_yup(trimesh, filename_prefix=filename_prefix)
             return io.NodeOutput(path)
 
 

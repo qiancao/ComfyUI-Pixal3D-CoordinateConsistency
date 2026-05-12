@@ -1171,6 +1171,16 @@ def rasterize_pbr(
 
     comfy.model_management.soft_empty_cache()
 
+    # Mesh + valid_pos are in Z-up (rotated by Pixal3DGenerateMesh to match
+    # TRELLIS2's verified-working cumesh/drtk regime). The voxelgrid is left
+    # in cascade-native Y-up (rotating a sparse integer voxel grid is harder
+    # and unnecessary). Rotate valid_pos Z-up -> Y-up just for the sparse
+    # voxel sample so it lines up with the voxelgrid's frame.
+    valid_pos_yup = torch.stack(
+        [valid_pos[:, 0], valid_pos[:, 2], -valid_pos[:, 1]],
+        dim=-1,
+    )
+
     with _phase("rasterize_pbr: grid_sample_3d (texels)"):
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
         coords_padded = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
@@ -1178,7 +1188,7 @@ def rasterize_pbr(
             attr_volume,
             coords_padded,
             shape=torch.Size([1, attr_volume.shape[1], *voxel_shape]),
-            grid=((valid_pos - aabb_min) / voxel_size_t).reshape(1, -1, 3),
+            grid=((valid_pos_yup - aabb_min) / voxel_size_t).reshape(1, -1, 3),
             mode="trilinear",
         )
 
@@ -1236,25 +1246,59 @@ def rasterize_pbr(
 
 
 # ----------------------------------------------------------------------------
-# Y-up rotation + write to disk. The last step in both paths.
+# Coordinate frame rotations.
+#
+# Pixal3D's cascade emits MeshWithVoxel.vertices in Y-up natively (the model
+# is camera-conditioned via MoGe-2 / DinoV3, training data is Y-up). TRELLIS2's
+# cascade is Z-up. The cumesh/drtk UV-bake regime in TRELLIS2 is visually
+# verified working on Z-up data; on Pixal3D's Y-up mesh the same code produces
+# garbled, seam-bleed textures. Fix: route the split-node UV-bake path through
+# Z-up internally (rotate at GenerateMesh, rotate `valid_pos` back for the
+# voxel sample, rotate back to Y-up at ExportGLB). Monolithic vertex-color
+# path stays Y-up throughout.
 # ----------------------------------------------------------------------------
+
+_YUP_TO_ZUP_ROT = np.array(
+    # (x, y, z) -> (x, -z, y). Inverse of _ZUP_TO_YUP_ROT.
+    [[1, 0,  0, 0],
+     [0, 0, -1, 0],
+     [0, 1,  0, 0],
+     [0, 0,  0, 1]],
+    dtype=np.float64,
+)
+
+_ZUP_TO_YUP_ROT = np.array(
+    # (x, y, z) -> (x, z, -y). Matches TRELLIS2 nodes_unwrap.py:1325 verbatim
+    # assignment: vertices[:, 1], vertices[:, 2] = vertices[:, 2], -vertices[:, 1].
+    [[1,  0, 0, 0],
+     [0,  0, 1, 0],
+     [0, -1, 0, 0],
+     [0,  0, 0, 1]],
+    dtype=np.float64,
+)
+
 
 def export_glb(tri, filename_prefix: str = "pixal3d") -> str:
     """Write the trimesh to ComfyUI's output dir as a GLB and return the absolute path.
 
-    No coordinate rotation is applied. Empirically pixal3d's MeshWithVoxel vertices
-    are already in Y-up: every rotation we tried (pixal3d's own (-x,-z,-y),
-    (x, z, -y), (x, -z, y)) produced a model with its up-axis on Z, consistent
-    with the input already being Y-up. The upstream inference.py rotation only
-    makes sense if applied to o_voxel.postprocess.to_glb's output (which internally
-    converts to some other frame); we skip to_glb entirely and read MeshWithVoxel
-    directly, so no rotation is needed."""
+    No coordinate rotation is applied. Used by the monolithic vertex-color path
+    where the mesh stays Y-up throughout (Pixal3D's cascade-native frame).
+    For the split-node UV-bake path use export_glb_yup, which un-rotates the
+    Z-up working frame back to Y-up for the final GLB."""
     out_dir = folder_paths.get_output_directory()
     ts = int(time.time() * 1000)
     out_path = os.path.join(out_dir, f"{filename_prefix}_{ts}.glb")
     tri.export(out_path)
     log.info(f"[pixal3d] Saved GLB to {out_path}")
     return out_path
+
+
+def export_glb_yup(tri, filename_prefix: str = "pixal3d") -> str:
+    """Rotate Z-up -> Y-up, then write to ComfyUI's output dir. Used by the
+    split-node UV-bake path where ProcessMesh/RasterizePBR run in a Z-up
+    working frame matching TRELLIS2's verified-good regime."""
+    tri.apply_transform(_ZUP_TO_YUP_ROT)
+    return export_glb(tri, filename_prefix=filename_prefix)
 
 
 # ----------------------------------------------------------------------------
