@@ -19,7 +19,7 @@ class Pixal3DPreprocessImage(io.ComfyNode):
             category="Pixal3D",
             description=(
                 "Pure-PIL preprocess for Pixal3D: alpha-bbox crop (using MASK), "
-                "downscale longest side to 1024, fill background with bg_r/g/b. "
+                "downscale longest side to 1024, fill background with solid black. "
                 "Background removal is NOT done here -- feed in a MASK from LoadImage "
                 "(if the source PNG has transparency) or from any rembg node "
                 "(Comfy-rembg, BRIA-RMBG, etc.). If no MASK is wired, the full image "
@@ -28,9 +28,6 @@ class Pixal3DPreprocessImage(io.ComfyNode):
             inputs=[
                 io.Image.Input("image"),
                 io.Mask.Input("mask", optional=True, tooltip="Subject mask (1.0=opaque). LoadImage's MASK output works directly."),
-                io.Int.Input("bg_r", default=0, min=0, max=255, optional=True),
-                io.Int.Input("bg_g", default=0, min=0, max=255, optional=True),
-                io.Int.Input("bg_b", default=0, min=0, max=255, optional=True),
             ],
             outputs=[
                 io.Image.Output(display_name="image"),
@@ -38,10 +35,10 @@ class Pixal3DPreprocessImage(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, image, mask=None, bg_r: int = 0, bg_g: int = 0, bg_b: int = 0):
+    def execute(cls, image, mask=None):
         from .stages import preprocess_image, _phase
         with _phase("Pixal3DPreprocessImage.execute"):
-            out = preprocess_image(image, mask=mask, bg_color=(bg_r, bg_g, bg_b))
+            out = preprocess_image(image, mask=mask)
             return io.NodeOutput(out)
 
 

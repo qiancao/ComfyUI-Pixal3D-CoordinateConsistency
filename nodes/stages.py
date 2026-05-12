@@ -382,8 +382,16 @@ def _wrap_with_comfy_patcher(model):
     _orig_to = model.to
     _orig_cpu = model.cpu
 
+    # Re-entry guard: ComfyUI's ModelPatcher.patch_model internally calls
+    # model.to(device) -- which is OUR _patched_to. Without this guard we'd
+    # recurse into load_models_gpu forever. With it, the inner call falls
+    # through to _orig_to so the actual nn.Module move happens.
+    import threading
+    _reentry = threading.local()
+
     def _patched_to(*args, **kwargs):
-        # Detect a request to move to the active CUDA device (pixal3d's swap-in).
+        if getattr(_reentry, "inside", False):
+            return _orig_to(*args, **kwargs)
         tgt = args[0] if args else kwargs.get("device")
         is_cuda_target = False
         if isinstance(tgt, torch.device):
@@ -391,15 +399,32 @@ def _wrap_with_comfy_patcher(model):
         elif isinstance(tgt, str):
             is_cuda_target = tgt.startswith("cuda")
         if is_cuda_target:
-            comfy.model_management.load_models_gpu([patcher])
+            _reentry.inside = True
+            try:
+                # Inform ComfyUI's memory manager (auto-offloads competing models).
+                comfy.model_management.load_models_gpu([patcher])
+                # ModelPatcher doesn't always physically move the wrapped module's
+                # parameters -- it manages cast/lowvram patches for its own forward
+                # mechanism. Pixal3D code accesses .weight directly via standard
+                # nn.Module attributes, so we must also call the real .to() to
+                # actually relocate the tensors.
+                _orig_to(*args, **kwargs)
+            finally:
+                _reentry.inside = False
             return model
-        # Anything else (dtype-only, explicit CPU, etc.): pass through.
         return _orig_to(*args, **kwargs)
 
     def _patched_cpu():
-        # pixal3d's swap-out: unpatch + tell ComfyUI we're done with this slot.
-        patcher.unpatch_model(device_to=offload_device)
-        comfy.model_management.soft_empty_cache()
+        if getattr(_reentry, "inside", False):
+            return _orig_cpu()
+        _reentry.inside = True
+        try:
+            patcher.unpatch_model(device_to=offload_device)
+            # Same reason as above: physically move the module's tensors back.
+            _orig_cpu()
+            comfy.model_management.soft_empty_cache()
+        finally:
+            _reentry.inside = False
         return model
 
     model.to = _patched_to
