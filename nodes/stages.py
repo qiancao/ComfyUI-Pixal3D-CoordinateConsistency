@@ -1239,25 +1239,16 @@ def rasterize_pbr(
 # Y-up rotation + write to disk. The last step in both paths.
 # ----------------------------------------------------------------------------
 
-_GLB_YUP_ROT = np.array(
-    # Z-up -> Y-up rotation (-90 deg around X): (x, y, z) -> (x, z, -y).
-    # Applied as v' = M @ v on homogeneous column vectors, so:
-    #   row 1 picks z  -> new_y =  old_z
-    #   row 2 picks -y -> new_z = -old_y
-    # Matches TRELLIS2 nodes_unwrap.py:1325 verbatim assignment
-    #   vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
-    [[1,  0, 0, 0],
-     [0,  0, 1, 0],
-     [0, -1, 0, 0],
-     [0,  0, 0, 1]],
-    dtype=np.float64,
-)
-
-
 def export_glb(tri, filename_prefix: str = "pixal3d") -> str:
-    """Apply the standard Z-up -> Y-up rotation and write to ComfyUI's output dir.
-    Returns the absolute filepath."""
-    tri.apply_transform(_GLB_YUP_ROT)
+    """Write the trimesh to ComfyUI's output dir as a GLB and return the absolute path.
+
+    No coordinate rotation is applied. Empirically pixal3d's MeshWithVoxel vertices
+    are already in Y-up: every rotation we tried (pixal3d's own (-x,-z,-y),
+    (x, z, -y), (x, -z, y)) produced a model with its up-axis on Z, consistent
+    with the input already being Y-up. The upstream inference.py rotation only
+    makes sense if applied to o_voxel.postprocess.to_glb's output (which internally
+    converts to some other frame); we skip to_glb entirely and read MeshWithVoxel
+    directly, so no rotation is needed."""
     out_dir = folder_paths.get_output_directory()
     ts = int(time.time() * 1000)
     out_path = os.path.join(out_dir, f"{filename_prefix}_{ts}.glb")
