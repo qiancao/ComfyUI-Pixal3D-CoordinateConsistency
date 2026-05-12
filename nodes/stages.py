@@ -12,6 +12,13 @@ import time
 from pathlib import Path
 from typing import Optional
 
+# Pixal3D's image-cond models call `torch.hub.load("valeoai/NAF", "naf", ...)` which
+# hits api.github.com for repo validation. If a bad GITHUB_TOKEN is in the env
+# (common with multi-account dev setups), the GitHub API returns 401 and torch.hub
+# refuses to download. Strip the token here — public repo validation does not
+# require auth.
+os.environ.pop("GITHUB_TOKEN", None)
+
 import numpy as np
 import torch
 from PIL import Image
@@ -176,6 +183,33 @@ def _download_pixal3d_weights():
 # Pipeline init
 # ============================================================================
 
+def _patch_rembg_to_public_model():
+    """Pixal3D's pipeline.json pins briaai/RMBG-2.0 which is a gated HF repo.
+    Substitute the public ZhengPeng7/BiRefNet (same architecture, MIT-licensed).
+    Idempotent.
+    """
+    import pixal3d.pipelines.rembg as _rembg
+    if getattr(_rembg.BiRefNet, "_pixal3d_patched", False):
+        return
+    _orig = _rembg.BiRefNet.__init__
+
+    def _patched(self, model_name="ZhengPeng7/BiRefNet", **kwargs):
+        if model_name == "briaai/RMBG-2.0":
+            log.info(
+                "[rembg] Substituting gated 'briaai/RMBG-2.0' -> public "
+                "'ZhengPeng7/BiRefNet' (same arch; accept the license at "
+                "huggingface.co/briaai/RMBG-2.0 and set HF_TOKEN for the original)."
+            )
+            model_name = "ZhengPeng7/BiRefNet"
+        _orig(self, model_name=model_name, **kwargs)
+        # ZhengPeng7/BiRefNet ships as fp16 but the upstream caller doesn't cast inputs.
+        # Force float32 so transforms (which produce float32 by default) work.
+        self.model.float()
+
+    _rembg.BiRefNet.__init__ = _patched
+    _rembg.BiRefNet._pixal3d_patched = True
+
+
 def init_pipeline(low_vram: bool = False) -> "object":
     """Load + cache Pixal3D pipeline + 4 DinoV3 cond models. Idempotent."""
     global _pipeline
@@ -185,6 +219,8 @@ def init_pipeline(low_vram: bool = False) -> "object":
 
     _check_gpu_or_raise()
     local_dir = _download_pixal3d_weights()
+
+    _patch_rembg_to_public_model()
 
     from pixal3d.pipelines import Pixal3DImageTo3DPipeline
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
@@ -229,6 +265,12 @@ def _build_cond(key: str):
     )
     model = DinoV3ProjFeatureExtractor(**IMAGE_COND_CONFIGS[key])
     model.eval()
+    # transformers >=5.0 moved DINOv3's transformer-layer ModuleList from
+    # `DINOv3ViTModel.layer` to `DINOv3ViTModel.model.layer`. Pixal3D's
+    # extract_features iterates `self.model.layer` directly — alias it back.
+    inner = model.model
+    if not hasattr(inner, "layer") and hasattr(inner, "model") and hasattr(inner.model, "layer"):
+        inner.layer = inner.model.layer
     return model
 
 
