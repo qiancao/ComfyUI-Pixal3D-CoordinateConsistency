@@ -268,11 +268,15 @@ def _set_attention_backends(backend: str):
     log.info(f"[attn] dense + sparse backend = {resolved} (requested: {backend})")
 
 
-def init_pipeline(low_vram: bool = False, attn_backend: str = "auto") -> "object":
-    """Load + cache Pixal3D pipeline + 4 DinoV3 cond models. Idempotent."""
+def init_pipeline(attn_backend: str = "auto") -> "object":
+    """Load + cache Pixal3D pipeline + 4 DinoV3 cond models. Idempotent.
+
+    The cascade always runs in per-stage swap mode (pixal3d's `low_vram=True`).
+    This is the only mode that fits a 24 GB GPU; off-stage models are held on
+    CPU which is the ComfyUI-native expectation. We don't expose a knob.
+    """
     global _pipeline
     if _pipeline is not None:
-        _pipeline.low_vram = low_vram
         _set_attention_backends(attn_backend)
         return _pipeline
 
@@ -296,7 +300,10 @@ def init_pipeline(low_vram: bool = False, attn_backend: str = "auto") -> "object
     pipeline.image_cond_model_shape_1024 = _build_cond("shape_1024")
     pipeline.image_cond_model_tex_1024 = _build_cond("tex_1024")
 
-    pipeline.low_vram = low_vram
+    # Always per-stage swap (pixal3d's `low_vram=True`): cascade DiTs swap CPU<->GPU
+    # between stages. This is the only mode that fits a 24 GB card and aligns with
+    # ComfyUI's expectation that off-stage models live on CPU.
+    pipeline.low_vram = True
     device = comfy.model_management.get_torch_device()
     pipeline.to(device)
 
@@ -453,7 +460,6 @@ def generate_glb(
     seed: int = 42,
     pipeline_type: str = "1024_cascade",
     max_num_tokens: int = 49152,
-    low_vram: bool = False,
     # Sampler knobs (defaults match inference.py)
     ss_steps: int = 12,
     ss_guidance: float = 7.5,
@@ -476,7 +482,7 @@ def generate_glb(
     filename_prefix: str = "pixal3d",
 ) -> str:
     """Run cascade + extract GLB. Returns absolute path to the saved GLB."""
-    pipeline = init_pipeline(low_vram=low_vram)
+    pipeline = init_pipeline()
 
     pil = comfy_image_to_pil(image)
 

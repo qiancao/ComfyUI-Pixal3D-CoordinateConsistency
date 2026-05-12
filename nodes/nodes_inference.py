@@ -173,7 +173,6 @@ class Pixal3DGenerateGLB(io.ComfyNode):
         from .stages import generate_glb
 
         pipeline_type = pipeline.get("pipeline_type", "1024_cascade")
-        low_vram = pipeline.get("low_vram", False)
 
         out = generate_glb(
             image=image,
@@ -181,7 +180,6 @@ class Pixal3DGenerateGLB(io.ComfyNode):
             seed=seed,
             pipeline_type=pipeline_type,
             max_num_tokens=max_num_tokens,
-            low_vram=low_vram,
             ss_steps=ss_steps,
             ss_guidance=ss_guidance,
             ss_rescale=ss_rescale,
