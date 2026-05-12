@@ -800,19 +800,37 @@ def generate_glb(
     base_color_slice = pipeline.pbr_attr_layout.get("base_color", slice(0, 3))
     rgb = vattrs[:, base_color_slice].clamp(0.0, 1.0).cpu().numpy()
     rgb = (rgb * 255).astype(np.uint8)
+    alpha_slice = pipeline.pbr_attr_layout.get("alpha", None)
+
+    material = None
     if force_opaque:
-        a = np.full((rgb.shape[0], 1), 255, dtype=np.uint8)
-        vertex_colors = np.concatenate([rgb, a], axis=1)
+        # 3-channel COLOR_0 (VEC3). No alpha attribute in the glTF at all, so
+        # three.js / model-viewer / etc. can't auto-switch to BLEND mode based
+        # on a "present" alpha channel. Cleanest opaque output.
+        vertex_colors = rgb
+    elif alpha_slice is not None:
+        # 4-channel COLOR_0 (VEC4) + explicit PBRMaterial(alphaMode=BLEND,
+        # doubleSided=True). three.js GLTFLoader honors the material's
+        # alphaMode and does proper depth-sorted translucency. doubleSided
+        # so thin shells (glass, foliage) render from both sides.
+        a = vattrs[:, alpha_slice].clamp(0.0, 1.0).cpu().numpy()
+        a = (a * 255).astype(np.uint8)
+        if a.ndim == 2 and a.shape[1] == 1:
+            a = a[:, 0]
+        vertex_colors = np.concatenate([rgb, a[:, None]], axis=1)
+        # Note: deliberately NOT passing baseColorFactor -- trimesh treats it as
+        # uint8 in the 0-255 range and divides by 255, so [1.0,1.0,1.0,1.0]
+        # becomes [0.0039,...]. Omitting it falls back to glTF's default
+        # [1,1,1,1] which is what we want (vertex_colors carry the actual color).
+        material = trimesh.visual.material.PBRMaterial(
+            name="pixal3d_translucent",
+            alphaMode="BLEND",
+            doubleSided=True,
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+        )
     else:
-        alpha_slice = pipeline.pbr_attr_layout.get("alpha", None)
-        if alpha_slice is not None:
-            a = vattrs[:, alpha_slice].clamp(0.0, 1.0).cpu().numpy()
-            a = (a * 255).astype(np.uint8)
-            if a.ndim == 2 and a.shape[1] == 1:
-                a = a[:, 0]
-            vertex_colors = np.concatenate([rgb, a[:, None]], axis=1)
-        else:
-            vertex_colors = rgb
+        vertex_colors = rgb  # pipeline has no alpha layout key -- treat as opaque
 
     tri = trimesh.Trimesh(
         vertices=verts.cpu().numpy(),
@@ -820,6 +838,18 @@ def generate_glb(
         vertex_colors=vertex_colors,
         process=False,
     )
+
+    # Fix mesh winding -- the shape decoder produces inconsistent/inverted
+    # winding (we measured mixed inward/outward face normals on prior runs).
+    # Upstream pixal3d cleaned this up inside o_voxel.postprocess.to_glb(remesh=True),
+    # which our drtk fork stripped. trimesh.repair.fix_winding walks face
+    # adjacency to align winding, then flips globally if the resulting volume
+    # has negative sign. Cheap equivalent of upstream's remesh-driven fix.
+    with _phase("fix_winding"):
+        trimesh.repair.fix_winding(tri)
+
+    if material is not None:
+        tri.visual.material = material
 
     # GLTF rotation (Y-up) — verbatim from inference.py:181
     rot = np.array(
