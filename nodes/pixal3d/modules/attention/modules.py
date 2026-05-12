@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .full_attn import scaled_dot_product_attention
 from .rope import RotaryPositionEmbedder
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -52,16 +54,16 @@ class MultiHeadAttention(nn.Module):
         self.qk_rms_norm = qk_rms_norm
 
         if self._type == "self":
-            self.to_qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
+            self.to_qkv = ops.Linear(channels, channels * 3, bias=qkv_bias)
         else:
-            self.to_q = nn.Linear(channels, channels, bias=qkv_bias)
-            self.to_kv = nn.Linear(self.ctx_channels, channels * 2, bias=qkv_bias)
+            self.to_q = ops.Linear(channels, channels, bias=qkv_bias)
+            self.to_kv = ops.Linear(self.ctx_channels, channels * 2, bias=qkv_bias)
             
         if self.qk_rms_norm:
             self.q_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
             self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
             
-        self.to_out = nn.Linear(channels, channels)
+        self.to_out = ops.Linear(channels, channels)
     
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, C = x.shape

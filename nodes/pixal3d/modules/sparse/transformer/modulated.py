@@ -5,6 +5,8 @@ from ..basic import VarLenTensor, SparseTensor
 from ..attention import SparseMultiHeadAttention, SparseProjectAttention, SparseGatedProjectAttention
 from ...norm import LayerNorm32
 from .blocks import SparseFeedForwardNet
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class ModulatedSparseTransformerBlock(nn.Module):
@@ -49,7 +51,7 @@ class ModulatedSparseTransformerBlock(nn.Module):
         if not share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(channels, 6 * channels, bias=True)
+                ops.Linear(channels, 6 * channels, bias=True)
             )
         else:
             self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
@@ -173,7 +175,7 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         if not share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(channels, 6 * channels, bias=True)
+                ops.Linear(channels, 6 * channels, bias=True)
             )
         else:
             self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)

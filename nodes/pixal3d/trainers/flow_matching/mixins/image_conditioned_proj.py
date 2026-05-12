@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
+import comfy.model_management
 
 
 # =============================================================================
@@ -166,7 +167,7 @@ class ProjGrid(nn.Module):
         ])
         grid_points = torch.matmul(grid_points, rotation_matrix.T)
         grid_points = grid_points.reshape(-1, 3)
-        self.register_buffer('grid_points', grid_points)  # [R³, 3]
+        self.register_buffer('grid_points', grid_points)  # [R^3, 3]
         
         # Default front view transformation matrix
         front_view_transform_matrix = torch.tensor([
@@ -198,7 +199,7 @@ class ProjGrid(nn.Module):
             BHWC: Whether features_map is in BHWC format
             
         Returns:
-            Projected features, shape [B, grid_resolution³, C]
+            Projected features, shape [B, grid_resolution^3, C]
         """
         if BHWC:
             B, H, W, C = features_map.shape
@@ -348,8 +349,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     This extractor produces both:
     1. Global features (CLS token + register tokens) in embed_dim
     2. View-aligned projected features (3D grid projected to 2D and sampled)
-       - Without NAF: [B, R³, embed_dim]
-       - With NAF:    [B, R³, embed_dim * 2]  (concat of lr and hr features)
+       - Without NAF: [B, R^3, embed_dim]
+       - With NAF:    [B, R^3, embed_dim * 2]  (concat of lr and hr features)
     
     NOTE: proj_linear has been moved to per-block ProjectAttention / SparseProjectAttention.
     This module now outputs raw DINOv3 features for proj (optionally concatenated with NAF-upsampled features).
@@ -432,11 +433,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         return self
 
     def cuda(self):
-        super().cuda()
-        self.model.cuda()
-        self.proj_grid.cuda()
+        super().to(comfy.model_management.get_torch_device())
+        self.model.to(comfy.model_management.get_torch_device())
+        self.proj_grid.to(comfy.model_management.get_torch_device())
         if self.naf_model is not None:
-            self.naf_model.cuda()
+            self.naf_model.to(comfy.model_management.get_torch_device())
         return self
 
     def cpu(self):
@@ -482,7 +483,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         Returns:
             Tuple of (global_features, proj_features):
             - global_features: [B, num_global_tokens, embed_dim]
-            - proj_features: [B, grid_resolution³, proj_channels]
+            - proj_features: [B, grid_resolution^3, proj_channels]
               where proj_channels = embed_dim (no NAF) or embed_dim*2 (with NAF)
         """
         # Handle input types
@@ -493,7 +494,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(comfy.model_management.get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -531,7 +532,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                 distance, 
                 mesh_scale,
                 transform_matrix
-            )  # [B, grid_res³, D]
+            )  # [B, grid_res^3, D]
             
             # --- High-resolution branch (NAF): upsample then sample ---
             if self.use_naf_upsample:
@@ -550,12 +551,12 @@ class DinoV3ProjFeatureExtractor(nn.Module):
                     mesh_scale,
                     transform_matrix,
                     BHWC=False  # hr_features is [B, C, H', W']
-                )  # [B, grid_res³, D]
+                )  # [B, grid_res^3, D]
                 
-                # Concatenate lr and hr: [B, grid_res³, D*2]
+                # Concatenate lr and hr: [B, grid_res^3, D*2]
                 z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
             else:
-                z_proj = z_proj_lr  # [B, grid_res³, D]
+                z_proj = z_proj_lr  # [B, grid_res^3, D]
                 
             # Combine global tokens
             z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
@@ -693,11 +694,11 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         return self
     
     def cuda(self):
-        super().cuda()
-        self.dino_model.cuda()
-        self.proj_grid.cuda()
+        super().to(comfy.model_management.get_torch_device())
+        self.dino_model.to(comfy.model_management.get_torch_device())
+        self.proj_grid.to(comfy.model_management.get_torch_device())
         if self._vae is not None:
-            self._vae.cuda()
+            self._vae.to(comfy.model_management.get_torch_device())
         return self
     
     def cpu(self):
@@ -745,8 +746,8 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         Returns:
             Tuple of (global_features, proj_semantic, proj_color):
             - global_features: [B, num_global_tokens, embed_dim] (DINOv3 CLS + registers)
-            - proj_semantic: [B, grid_res³, embed_dim] (DINOv3 projected features)
-            - proj_color: [B, grid_res³, vae_channels] (VAE projected features)
+            - proj_semantic: [B, grid_res^3, embed_dim] (DINOv3 projected features)
+            - proj_color: [B, grid_res^3, vae_channels] (VAE projected features)
         """
         # Handle input types
         if isinstance(image, torch.Tensor):
@@ -756,7 +757,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(comfy.model_management.get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -783,7 +784,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             proj_semantic = self.proj_grid(
                 z_patchtokens_spatial,
                 camera_angle_x, distance, mesh_scale, transform_matrix,
-            )  # [B, R³, embed_dim]
+            )  # [B, R^3, embed_dim]
             
             z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
             
@@ -794,7 +795,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
                 vae_latent,
                 camera_angle_x, distance, mesh_scale, transform_matrix,
                 BHWC=False,  # VAE latent is [B, C, H, W]
-            )  # [B, R³, 16]
+            )  # [B, R^3, 16]
         
         return z_global, proj_semantic, proj_color
 
@@ -836,7 +837,7 @@ class ImageConditionedProjMixin:
                 from . import image_conditioned
                 self.image_cond_model = getattr(image_conditioned, model_name)(**model_args)
             
-            self.image_cond_model.cuda()
+            self.image_cond_model.to(comfy.model_management.get_torch_device())
             
             # Expose proj_channels for denoiser to know the correct proj_in_channels
             if hasattr(self.image_cond_model, 'proj_channels'):
@@ -1051,7 +1052,7 @@ class ImageConditionedProjMixin:
                     model_ckpts[name] = model.state_dict()
                     continue
 
-                # Partial ckpt (no backbone) → load with strict=False
+                # Partial ckpt (no backbone) -> load with strict=False
                 missing, unexpected = model.load_state_dict(model_ckpt, strict=False)
                 # All missing keys should be the frozen DINOv3 backbone; verify
                 non_backbone_missing = [k for k in missing

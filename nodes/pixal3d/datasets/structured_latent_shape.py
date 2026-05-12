@@ -10,6 +10,7 @@ from ..modules.sparse import SparseTensor
 from .structured_latent import SLatVisMixin, SLat
 from ..utils.render_utils import get_renderer, yaw_pitch_r_fov_to_extrinsics_intrinsics
 from ..utils.data_utils import load_balanced_group_indices
+import comfy.model_management
 
 
 class SLatShapeVisMixin(SLatVisMixin):
@@ -24,7 +25,7 @@ class SLatShapeVisMixin(SLatVisMixin):
         else:
             decoder = models.from_pretrained(self.pretrained_slat_dec)
         decoder.set_resolution(self.resolution)
-        self.slat_dec = decoder.cuda().eval()
+        self.slat_dec = decoder.to(comfy.model_management.get_torch_device()).eval()
 
     @torch.no_grad()
     def visualize_sample(
@@ -49,7 +50,7 @@ class SLatShapeVisMixin(SLatVisMixin):
                 'gt_view': [B, 3, 512, 512] - GT camera view (if camera params provided)
         """
         x_0 = x_0 if isinstance(x_0, SparseTensor) else x_0['x_0']
-        reps = self.decode_latent(x_0.cuda())
+        reps = self.decode_latent(x_0.to(comfy.model_management.get_torch_device()))
         
         # build fixed camera views (4 views: 0°, 90°, 180°, 270°)
         yaw = [0, np.pi/2, np.pi, 3*np.pi/2]
@@ -72,7 +73,7 @@ class SLatShapeVisMixin(SLatVisMixin):
         
         for i, representation in enumerate(reps):
             # Render 4 fixed views (2x2 grid)
-            image = torch.zeros(3, 1024, 1024).cuda()
+            image = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())
             tile = [2, 2]
             
             # Validate mesh data before rasterization
@@ -98,7 +99,7 @@ class SLatShapeVisMixin(SLatVisMixin):
                     image[:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = res['normal']
             except RuntimeError as e:
                 print(f"[visualize_sample] Warning: render failed for sample {i}: {e}")
-                image = torch.zeros(3, 1024, 1024).cuda()
+                image = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())
             multiview_images.append(image)
             
             # Render GT camera view using the fixed front view (same as sparse_structure_latent.py)

@@ -8,6 +8,7 @@ from PIL import Image
 from ..renderers import MeshRenderer, VoxelRenderer, PbrMeshRenderer
 from ..representations import Mesh, Voxel, MeshWithPbrMaterial, MeshWithVoxel
 from .random_utils import sphere_hammersley_sequence
+import comfy.model_management
 
 
 def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
@@ -22,15 +23,15 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
     extrinsics = []
     intrinsics = []
     for yaw, pitch, r, fov in zip(yaws, pitchs, rs, fovs):
-        fov = torch.deg2rad(torch.tensor(float(fov))).cuda()
-        yaw = torch.tensor(float(yaw)).cuda()
-        pitch = torch.tensor(float(pitch)).cuda()
+        fov = torch.deg2rad(torch.tensor(float(fov))).to(comfy.model_management.get_torch_device())
+        yaw = torch.tensor(float(yaw)).to(comfy.model_management.get_torch_device())
+        pitch = torch.tensor(float(pitch)).to(comfy.model_management.get_torch_device())
         orig = torch.tensor([
             torch.sin(yaw) * torch.cos(pitch),
             torch.cos(yaw) * torch.cos(pitch),
             torch.sin(pitch),
-        ]).cuda() * r
-        extr = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
+        ]).to(comfy.model_management.get_torch_device()) * r
+        extr = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().to(comfy.model_management.get_torch_device()), torch.tensor([0, 0, 1]).float().to(comfy.model_management.get_torch_device()))
         intr = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
         extrinsics.append(extr)
         intrinsics.append(intr)
@@ -86,7 +87,7 @@ def render_video(sample, resolution=1024, bg_color=(0, 0, 0), num_frames=40, r=2
     Render a turntable video of the sample.
     
     Args:
-        start_yaw: Starting yaw angle in radians. If None, defaults to π/2.
+        start_yaw: Starting yaw angle in radians. If None, defaults to pi/2.
         start_pitch: Starting pitch angle in radians. If None, uses the default oscillating pitch
                      starting at ~0.25.
     """
@@ -139,12 +140,12 @@ def proj_camera_to_render_params(camera_angle_x, distance):
         extrinsics: [4, 4] OpenCV world-to-camera (on CUDA)
         intrinsics: [3, 3] OpenCV normalized intrinsics (on CUDA)
     """
-    orig = torch.tensor([0.0, 0.0, distance]).cuda()
-    target = torch.tensor([0.0, 0.0, 0.0]).cuda()
-    up = torch.tensor([0.0, 1.0, 0.0]).cuda()
+    orig = torch.tensor([0.0, 0.0, distance]).to(comfy.model_management.get_torch_device())
+    target = torch.tensor([0.0, 0.0, 0.0]).to(comfy.model_management.get_torch_device())
+    up = torch.tensor([0.0, 1.0, 0.0]).to(comfy.model_management.get_torch_device())
     extrinsics = utils3d.torch.extrinsics_look_at(orig, target, up)
     
-    fov_tensor = torch.tensor(camera_angle_x, dtype=torch.float32).cuda()
+    fov_tensor = torch.tensor(camera_angle_x, dtype=torch.float32).to(comfy.model_management.get_torch_device())
     intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov_tensor, fov_tensor)
     
     return extrinsics, intrinsics
@@ -188,7 +189,7 @@ def render_proj_aligned_video(sample, camera_angle_x, distance, resolution=1024,
             [ 0, 1, 0, 0],
             [-s, 0, c, 0],
             [ 0, 0, 0, 1],
-        ], dtype=torch.float32).cuda()
+        ], dtype=torch.float32).to(comfy.model_management.get_torch_device())
         
         # world-to-camera for rotated world: extr @ R_y^{-1}
         R_y_inv = R_y.clone()

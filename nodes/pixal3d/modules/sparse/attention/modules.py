@@ -6,6 +6,8 @@ from .. import VarLenTensor, SparseTensor
 from .full_attn import sparse_scaled_dot_product_attention
 from .windowed_attn import sparse_windowed_scaled_dot_product_self_attention
 from .rope import SparseRotaryPositionEmbedder
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class SparseMultiHeadRMSNorm(nn.Module):
@@ -60,22 +62,22 @@ class SparseMultiHeadAttention(nn.Module):
         self.qk_rms_norm = qk_rms_norm
 
         if self._type == "self":
-            self.to_qkv = nn.Linear(channels, channels * 3, bias=qkv_bias)
+            self.to_qkv = ops.Linear(channels, channels * 3, bias=qkv_bias)
         else:
-            self.to_q = nn.Linear(channels, channels, bias=qkv_bias)
-            self.to_kv = nn.Linear(self.ctx_channels, channels * 2, bias=qkv_bias)
+            self.to_q = ops.Linear(channels, channels, bias=qkv_bias)
+            self.to_kv = ops.Linear(self.ctx_channels, channels * 2, bias=qkv_bias)
         
         if self.qk_rms_norm:
             self.q_rms_norm = SparseMultiHeadRMSNorm(self.head_dim, num_heads)
             self.k_rms_norm = SparseMultiHeadRMSNorm(self.head_dim, num_heads)
             
-        self.to_out = nn.Linear(channels, channels)
+        self.to_out = ops.Linear(channels, channels)
 
         if use_rope:
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
 
     @staticmethod
-    def _linear(module: nn.Linear, x: Union[VarLenTensor, torch.Tensor]) -> Union[VarLenTensor, torch.Tensor]:
+    def _linear(module: ops.Linear, x: Union[VarLenTensor, torch.Tensor]) -> Union[VarLenTensor, torch.Tensor]:
         if isinstance(x, VarLenTensor):
             return x.replace(module(x.feats))
         else:

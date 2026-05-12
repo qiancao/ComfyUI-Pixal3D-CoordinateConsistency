@@ -14,6 +14,7 @@ from ..representations import Voxel
 from ..representations.mesh import MeshWithPbrMaterial, TextureFilterMode, TextureWrapMode, AlphaMode, PbrMaterial, Texture
 
 from ..utils.data_utils import load_balanced_group_indices
+import comfy.model_management
 
 
 def is_power_of_two(n: int) -> bool:
@@ -55,9 +56,9 @@ class SparseVoxelPbrVisMixin:
                 np.sin(yaw) * np.cos(pitch),
                 np.cos(yaw) * np.cos(pitch),
                 np.sin(pitch),
-            ]).float().cuda() * 2
-            fov = torch.deg2rad(torch.tensor(30)).cuda()
-            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
+            ]).float().to(comfy.model_management.get_torch_device()) * 2
+            fov = torch.deg2rad(torch.tensor(30)).to(comfy.model_management.get_torch_device())
+            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().to(comfy.model_management.get_torch_device()), torch.tensor([0, 0, 1]).float().to(comfy.model_management.get_torch_device()))
             intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
             exts.append(extrinsics)
             ints.append(intrinsics)
@@ -65,7 +66,7 @@ class SparseVoxelPbrVisMixin:
         images = {k: [] for k in self.layout}
         
         # Build each representation
-        x = x.cuda()
+        x = x.to(comfy.model_management.get_torch_device())
         for i in range(x.shape[0]):
             rep = Voxel(
                 origin=[-0.5, -0.5, -0.5],
@@ -77,7 +78,7 @@ class SparseVoxelPbrVisMixin:
                 }
             )
             for k in self.layout:
-                image = torch.zeros(3, 1024, 1024).cuda()
+                image = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())
                 tile = [2, 2]
                 for j, (ext, intr) in enumerate(zip(exts, ints)):
                     attr = x[i].feats[:, self.layout[k]].expand(-1, 3)

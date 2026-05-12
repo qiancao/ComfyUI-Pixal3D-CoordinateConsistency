@@ -204,10 +204,10 @@ def _patch_rembg_to_public_model():
         _orig(self, model_name=model_name, **kwargs)
         # ZhengPeng7/BiRefNet ships as fp16 but the upstream caller doesn't cast inputs.
         # Force float32 so transforms (which produce float32 by default) work.
-        # Also pin to CUDA — the pipeline's low_vram swap (`rembg_model.to(self.device)`)
-        # doesn't reliably take effect through the wrapper's `to()` signature; ~1 GB on
-        # GPU is a cheap price for correctness.
-        self.model.float().cuda()
+        # Also pin to the active torch device -- the pipeline's low_vram swap
+        # (`rembg_model.to(self.device)`) doesn't reliably take effect through
+        # the wrapper's `to()` signature; ~1 GB on GPU is a cheap price for correctness.
+        self.model.float().to(comfy.model_management.get_torch_device())
 
     _rembg.BiRefNet.__init__ = _patched
     _rembg.BiRefNet._pixal3d_patched = True
@@ -258,12 +258,13 @@ def init_pipeline(low_vram: bool = False, attn_backend: str = "auto") -> "object
     pipeline.image_cond_model_tex_1024 = _build_cond("tex_1024")
 
     pipeline.low_vram = low_vram
-    pipeline.cuda()
+    device = comfy.model_management.get_torch_device()
+    pipeline.to(device)
 
-    pipeline.image_cond_model_ss.cuda()
-    pipeline.image_cond_model_shape_512.cuda()
-    pipeline.image_cond_model_shape_1024.cuda()
-    pipeline.image_cond_model_tex_1024.cuda()
+    pipeline.image_cond_model_ss.to(device)
+    pipeline.image_cond_model_shape_512.to(device)
+    pipeline.image_cond_model_shape_1024.to(device)
+    pipeline.image_cond_model_tex_1024.to(device)
 
     log.info("[pixal3d] Pre-loading NAF upsamplers")
     for attr in (
@@ -308,7 +309,7 @@ def init_moge():
     from moge.model.v2 import MoGeModel
 
     log.info(f"[moge] Loading {MOGE_REPO}")
-    moge = MoGeModel.from_pretrained(MOGE_REPO).to("cuda")
+    moge = MoGeModel.from_pretrained(MOGE_REPO).to(comfy.model_management.get_torch_device())
     moge.eval()
     _moge_model = moge
     return moge
@@ -378,7 +379,7 @@ def estimate_camera(
     pil = comfy_image_to_pil(image)
     width, height = pil.size
     arr = np.asarray(pil, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).to("cuda")
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).to(comfy.model_management.get_torch_device())
 
     with torch.no_grad():
         out = moge.infer(tensor)

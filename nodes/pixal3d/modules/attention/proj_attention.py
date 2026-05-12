@@ -12,6 +12,8 @@ Supports two modes:
 from typing import *
 import torch
 import torch.nn as nn
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class ProjectAttention(nn.Module):
@@ -33,7 +35,7 @@ class ProjectAttention(nn.Module):
     def __init__(self, cross_attn_block: nn.Module, channels: int, proj_in_channels: int):
         super().__init__()
         self.cross_attn_block = cross_attn_block
-        self.proj_linear = nn.Linear(proj_in_channels, channels, bias=True)
+        self.proj_linear = ops.Linear(proj_in_channels, channels, bias=True)
         
     def forward(self, x: torch.Tensor, context: Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
         if isinstance(context, dict):
@@ -83,7 +85,7 @@ class GatedProjectAttention(nn.Module):
         """
         super().__init__()
         self.cross_attn_block = cross_attn_block
-        self.proj_linear = nn.Linear(dino_in_channels + vae_in_channels, channels, bias=True)
+        self.proj_linear = ops.Linear(dino_in_channels + vae_in_channels, channels, bias=True)
         # Zero-init: at start, fused=0, only global cross-attn contributes
         nn.init.zeros_(self.proj_linear.weight)
         nn.init.zeros_(self.proj_linear.bias)

@@ -947,10 +947,10 @@ class BasicTrainer:
             for i, g in enumerate(all_grad_norms):
                 print(f'  Rank {i} grad_norm: {g:.8f}')
             if is_synced:
-                print(f'  \033[92m✓ PASS: All gradients are synchronized!\033[0m')
+                print(f'  \033[92mPASS PASS: All gradients are synchronized!\033[0m')
             else:
                 max_diff = max(abs(g - ref_norm) for g in all_grad_norms)
-                print(f'  \033[91m✗ FAIL: Gradients are NOT synchronized! Max diff: {max_diff:.8f}\033[0m')
+                print(f'  \033[91mFAIL FAIL: Gradients are NOT synchronized! Max diff: {max_diff:.8f}\033[0m')
             print(f'{"="*60}\n')
 
     @abstractmethod

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 from lpips import LPIPS
+import comfy.model_management
 
 
 def smooth_l1_loss(pred, target, beta=1.0):
@@ -73,7 +74,7 @@ loss_fn_vgg = None
 def lpips(img1, img2, value_range=(0, 1)):
     global loss_fn_vgg
     if loss_fn_vgg is None:
-        loss_fn_vgg = LPIPS(net='vgg').cuda().eval()
+        loss_fn_vgg = LPIPS(net='vgg').to(comfy.model_management.get_torch_device()).eval()
     # normalize to [-1, 1]
     img1 = (img1 - value_range[0]) / (value_range[1] - value_range[0]) * 2 - 1
     img2 = (img2 - value_range[0]) / (value_range[1] - value_range[0]) * 2 - 1

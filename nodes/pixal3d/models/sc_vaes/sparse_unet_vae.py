@@ -6,6 +6,8 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class SparseResBlock3d(nn.Module):
@@ -276,9 +278,9 @@ class SparseConvNeXtBlock3d(nn.Module):
         self.norm = LayerNorm32(channels, elementwise_affine=True, eps=1e-6)
         self.conv = sp.SparseConv3d(channels, channels, 3)
         self.mlp = nn.Sequential(
-            nn.Linear(channels, int(channels * mlp_ratio)),
+            ops.Linear(channels, int(channels * mlp_ratio)),
             nn.SiLU(),
-            zero_module(nn.Linear(int(channels * mlp_ratio), channels)),
+            zero_module(ops.Linear(int(channels * mlp_ratio), channels)),
         )
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
@@ -364,7 +366,7 @@ class SparseUnetVaeEncoder(nn.Module):
     def initialize_weights(self) -> None:
         # Initialize transformer layers:
         def _basic_init(module):
-            if isinstance(module, nn.Linear):
+            if isinstance(module, ops.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
@@ -469,7 +471,7 @@ class SparseUnetVaeDecoder(nn.Module):
     def initialize_weights(self) -> None:
         # Initialize transformer layers:
         def _basic_init(module):
-            if isinstance(module, nn.Linear):
+            if isinstance(module, ops.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)

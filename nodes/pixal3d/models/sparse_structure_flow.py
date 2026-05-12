@@ -7,6 +7,8 @@ import numpy as np
 from ..modules.utils import convert_module_to, manual_cast, str_to_dtype
 from ..modules.transformer import AbsolutePositionEmbedder, ModulatedTransformerCrossBlock
 from ..modules.attention import RotaryPositionEmbedder
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class TimestepEmbedder(nn.Module):
@@ -16,9 +18,9 @@ class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            ops.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
+            ops.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
 
@@ -109,7 +111,7 @@ class SparseStructureFlowModel(nn.Module):
         if share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(model_channels, 6 * model_channels, bias=True)
+                ops.Linear(model_channels, 6 * model_channels, bias=True)
             )
 
         if pe_mode == "ape":
@@ -128,7 +130,7 @@ class SparseStructureFlowModel(nn.Module):
         if pe_mode != "rope":
             self.rope_phases = None
 
-        self.input_layer = nn.Linear(in_channels, model_channels)
+        self.input_layer = ops.Linear(in_channels, model_channels)
             
         self.blocks = nn.ModuleList([
             ModulatedTransformerCrossBlock(
@@ -150,7 +152,7 @@ class SparseStructureFlowModel(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        self.out_layer = nn.Linear(model_channels, out_channels)
+        self.out_layer = ops.Linear(model_channels, out_channels)
 
         self.initialize_weights()
         self.convert_to(self.dtype)
@@ -173,7 +175,7 @@ class SparseStructureFlowModel(nn.Module):
         if self.initialization == 'vanilla':
             # Initialize transformer layers:
             def _basic_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.xavier_uniform_(module.weight)
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
@@ -199,7 +201,7 @@ class SparseStructureFlowModel(nn.Module):
         elif self.initialization == 'scaled':
             # Initialize transformer layers:
             def _basic_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.normal_(module.weight, std=np.sqrt(2.0 / (5.0 * self.model_channels)))
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
@@ -207,7 +209,7 @@ class SparseStructureFlowModel(nn.Module):
             
             # Scaled init for to_out and ffn2
             def _scaled_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.normal_(module.weight, std=1.0 / np.sqrt(5 * self.num_blocks * self.model_channels))
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)

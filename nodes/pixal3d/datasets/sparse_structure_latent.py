@@ -10,6 +10,7 @@ from ..renderers import VoxelRenderer
 from .components import StandardDatasetBase, ImageConditionedMixin, ViewImageConditionedMixin
 from .. import models
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
+import comfy.model_management
 
 
 class SparseStructureLatentVisMixin:
@@ -37,7 +38,7 @@ class SparseStructureLatentVisMixin:
             decoder.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True))
         else:
             decoder = models.from_pretrained(self.pretrained_ss_dec)
-        self.ss_dec = decoder.cuda().eval()
+        self.ss_dec = decoder.to(comfy.model_management.get_torch_device()).eval()
 
     def _delete_ss_dec(self):
         del self.ss_dec
@@ -78,7 +79,7 @@ class SparseStructureLatentVisMixin:
                 'gt_view': [B, 3, 512, 512] - GT camera view (if camera params provided)
         """
         x_0 = x_0 if isinstance(x_0, torch.Tensor) else x_0['x_0']
-        x_0 = self.decode_latent(x_0.cuda())
+        x_0 = self.decode_latent(x_0.to(comfy.model_management.get_torch_device()))
         
         renderer = VoxelRenderer()
         renderer.rendering_options.resolution = 512
@@ -103,7 +104,7 @@ class SparseStructureLatentVisMixin:
         gt_view_images = []
         
         # Build each representation
-        x_0 = x_0.cuda()
+        x_0 = x_0.to(comfy.model_management.get_torch_device())
         for i in range(x_0.shape[0]):
             coords = torch.nonzero(x_0[i, 0] > 0, as_tuple=False)
             resolution = x_0.shape[-1]
@@ -121,7 +122,7 @@ class SparseStructureLatentVisMixin:
             )
             
             # Render 4 fixed views (2x2 grid)
-            image = torch.zeros(3, 1024, 1024).cuda()
+            image = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())
             tile = [2, 2]
             for j, (ext, intr) in enumerate(zip(fixed_exts, fixed_ints)):
                 res = renderer.render(rep, ext, intr, colors_overwrite=color)

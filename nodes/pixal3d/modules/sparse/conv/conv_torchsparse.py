@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 from .. import SparseTensor
 import torchsparse
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, padding=None, bias=True, indice_key=None):
-    self.conv = torchsparse.nn.Conv3d(in_channels, out_channels, kernel_size, stride, 0, dilation, bias)
+    self.conv = torchsparse.ops.Conv3d(in_channels, out_channels, kernel_size, stride, 0, dilation, bias)
 
 
 def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
@@ -18,7 +20,7 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
 
 
 def sparse_inverse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, bias=True, indice_key=None):
-    self.conv = torchsparse.nn.Conv3d(in_channels, out_channels, kernel_size, stride, 0, dilation, bias, transposed=True)
+    self.conv = torchsparse.ops.Conv3d(in_channels, out_channels, kernel_size, stride, 0, dilation, bias, transposed=True)
 
 
 def sparse_inverse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:

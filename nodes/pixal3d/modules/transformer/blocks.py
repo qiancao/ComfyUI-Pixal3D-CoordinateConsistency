@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from ..attention import MultiHeadAttention
 from ..norm import LayerNorm32
+import comfy.ops
+ops = comfy.ops.disable_weight_init
 
 
 class AbsolutePositionEmbedder(nn.Module):
@@ -50,9 +52,9 @@ class FeedForwardNet(nn.Module):
     def __init__(self, channels: int, mlp_ratio: float = 4.0):
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(channels, int(channels * mlp_ratio)),
+            ops.Linear(channels, int(channels * mlp_ratio)),
             nn.GELU(approximate="tanh"),
-            nn.Linear(int(channels * mlp_ratio), channels),
+            ops.Linear(int(channels * mlp_ratio), channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

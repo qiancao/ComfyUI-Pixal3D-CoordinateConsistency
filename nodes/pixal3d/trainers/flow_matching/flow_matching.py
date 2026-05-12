@@ -13,6 +13,7 @@ from .mixins.classifier_free_guidance import ClassifierFreeGuidanceMixin
 from .mixins.text_conditioned import TextConditionedMixin
 from .mixins.image_conditioned import ImageConditionedMixin
 from .mixins.image_conditioned_proj import ImageConditionedProjMixin
+import comfy.model_management
 
 
 class FlowMatchingTrainer(BasicTrainer):
@@ -218,7 +219,7 @@ class FlowMatchingTrainer(BasicTrainer):
         for i in range(0, num_samples, batch_size):
             batch = min(batch_size, num_samples - i)
             data = next(iter(dataloader))
-            data = {k: v[:batch].cuda() if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
+            data = {k: v[:batch].to(comfy.model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
             
             # Collect metadata (dataset_name and sha256) for wandb display
             if '_dataset_name' in data and '_sha256' in data:
@@ -488,7 +489,7 @@ class ImageConditionedProjFlowMatchingCFGTrainer(ImageConditionedProjMixin, Flow
         for i in range(0, num_samples, batch_size):
             batch = min(batch_size, num_samples - i)
             data = next(iter(dataloader))
-            data = {k: v[:batch].cuda() if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
+            data = {k: v[:batch].to(comfy.model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v[:batch] for k, v in data.items()}
             
             # Collect metadata (dataset_name and sha256) for wandb display
             if '_dataset_name' in data and '_sha256' in data:
@@ -629,7 +630,7 @@ class ImageConditionedProjFlowMatchingCFGTrainer(ImageConditionedProjMixin, Flow
         
         # Get one batch
         data = next(iter(dataloader))
-        data = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        data = {k: v.to(comfy.model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
         
         # Extract condition image
         cond = data.get('cond')

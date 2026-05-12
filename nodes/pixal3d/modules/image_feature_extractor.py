@@ -5,6 +5,7 @@ from torchvision import transforms
 from transformers import DINOv3ViTModel
 import numpy as np
 from PIL import Image
+import comfy.model_management
 
 
 class DinoV2FeatureExtractor:
@@ -23,7 +24,7 @@ class DinoV2FeatureExtractor:
         self.model.to(device)
 
     def cuda(self):
-        self.model.cuda()
+        self.model.to(comfy.model_management.get_torch_device())
 
     def cpu(self):
         self.model.cpu()
@@ -46,11 +47,11 @@ class DinoV2FeatureExtractor:
             image = [i.resize((518, 518), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(comfy.model_management.get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
-        image = self.transform(image).cuda()
+        image = self.transform(image).to(comfy.model_management.get_torch_device())
         features = self.model(image, is_training=True)['x_prenorm']
         patchtokens = F.layer_norm(features, features.shape[-1:])
         return patchtokens
@@ -73,7 +74,7 @@ class DinoV3FeatureExtractor:
         self.model.to(device)
 
     def cuda(self):
-        self.model.cuda()
+        self.model.to(comfy.model_management.get_torch_device())
 
     def cpu(self):
         self.model.cpu()
@@ -109,10 +110,10 @@ class DinoV3FeatureExtractor:
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = torch.stack(image).to(comfy.model_management.get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
-        image = self.transform(image).cuda()
+        image = self.transform(image).to(comfy.model_management.get_torch_device())
         features = self.extract_features(image)
         return features

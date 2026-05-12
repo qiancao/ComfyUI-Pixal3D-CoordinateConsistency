@@ -10,6 +10,8 @@ from ..modules import sparse as sp
 from ..modules.sparse.transformer import ModulatedSparseTransformerCrossBlock
 from .sparse_structure_flow import TimestepEmbedder
 from .sparse_elastic_mixin import SparseTransformerElasticMixin
+import comfy.ops
+ops = comfy.ops.disable_weight_init
     
 
 class SLatFlowModel(nn.Module):
@@ -68,7 +70,7 @@ class SLatFlowModel(nn.Module):
         if share_mod:
             self.adaLN_modulation = nn.Sequential(
                 nn.SiLU(),
-                nn.Linear(model_channels, 6 * model_channels, bias=True)
+                ops.Linear(model_channels, 6 * model_channels, bias=True)
             )
 
         if pe_mode == "ape":
@@ -119,7 +121,7 @@ class SLatFlowModel(nn.Module):
         if self.initialization == 'vanilla':
             # Initialize transformer layers:
             def _basic_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.xavier_uniform_(module.weight)
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
@@ -145,7 +147,7 @@ class SLatFlowModel(nn.Module):
         elif self.initialization == 'scaled':
             # Initialize transformer layers:
             def _basic_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.normal_(module.weight, std=np.sqrt(2.0 / (5.0 * self.model_channels)))
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)
@@ -153,7 +155,7 @@ class SLatFlowModel(nn.Module):
             
             # Scaled init for to_out and ffn2
             def _scaled_init(module):
-                if isinstance(module, nn.Linear):
+                if isinstance(module, ops.Linear):
                     torch.nn.init.normal_(module.weight, std=1.0 / np.sqrt(5 * self.num_blocks * self.model_channels))
                     if module.bias is not None:
                         nn.init.constant_(module.bias, 0)

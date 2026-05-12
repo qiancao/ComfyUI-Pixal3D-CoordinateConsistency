@@ -400,7 +400,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         max_num_tokens: int = 49152,
     ) -> SparseTensor:
         """
-        Sample structured latent with cascade (LR → HR).
+        Sample structured latent with cascade (LR -> HR).
         
         Args:
             lr_cond (dict): The conditioning information for LR stage.
@@ -699,7 +699,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         del cond_shape_lr
         torch.cuda.empty_cache()
 
-        # ---- Stage 3a: Upsample LR → HR ----
+        # ---- Stage 3a: Upsample LR -> HR ----
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True

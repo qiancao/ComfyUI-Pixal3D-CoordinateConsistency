@@ -3,6 +3,7 @@ import torch
 from ..voxel import Voxel
 import cumesh
 from flex_gemm.ops.grid_sample import grid_sample_3d
+import comfy.model_management
 
 
 class Mesh:
@@ -33,8 +34,8 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.clone().cuda().contiguous()
-        faces = self.faces.clone().cuda().contiguous()
+        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -57,8 +58,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def remove_faces(self, face_mask: torch.Tensor):
-        vertices = self.vertices.clone().cuda().contiguous()
-        faces = self.faces.clone().cuda().contiguous()
+        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -69,8 +70,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
-        vertices = self.vertices.clone().cuda().contiguous()
-        faces = self.faces.clone().cuda().contiguous()
+        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)

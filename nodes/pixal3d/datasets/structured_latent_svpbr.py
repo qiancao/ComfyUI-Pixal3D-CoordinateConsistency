@@ -13,6 +13,7 @@ from ..representations import MeshWithVoxel
 from ..renderers import PbrMeshRenderer, EnvMap
 from ..utils.data_utils import load_balanced_group_indices
 from ..utils.render_utils import yaw_pitch_r_fov_to_extrinsics_intrinsics
+import comfy.model_management
 
 
 class SLatPbrVisMixin:
@@ -47,7 +48,7 @@ class SLatPbrVisMixin:
             decoder.load_state_dict(torch.load(ckpt_path, map_location='cpu', weights_only=True))
         else:
             decoder = models.from_pretrained(self.pretrained_pbr_slat_dec)
-        self.pbr_slat_dec = decoder.cuda().eval()
+        self.pbr_slat_dec = decoder.to(comfy.model_management.get_torch_device()).eval()
 
         if self.shape_slat_dec_path is not None:
             cfg = json.load(open(os.path.join(self.shape_slat_dec_path, 'config.json'), 'r'))
@@ -57,7 +58,7 @@ class SLatPbrVisMixin:
         else:
             decoder = models.from_pretrained(self.pretrained_shape_slat_dec)
         decoder.set_resolution(self.resolution)
-        self.shape_slat_dec = decoder.cuda().eval()
+        self.shape_slat_dec = decoder.to(comfy.model_management.get_torch_device()).eval()
 
     def _delete_slat_dec(self):
         del self.pbr_slat_dec
@@ -93,8 +94,8 @@ class SLatPbrVisMixin:
     
     @torch.no_grad()
     def visualize_sample(self, sample: dict):
-        shape_z = sample['concat_cond'].cuda()
-        z = sample['x_0'].cuda()
+        shape_z = sample['concat_cond'].to(comfy.model_management.get_torch_device())
+        z = sample['x_0'].to(comfy.model_management.get_torch_device())
         reps = self.decode_latent(z, shape_z)
         
         # Extract camera parameters for GT view rendering (if available)
@@ -152,7 +153,7 @@ class SLatPbrVisMixin:
                         if k not in images:
                             images[k] = []
                         if k not in image:
-                            image[k] = torch.zeros(3, 1024, 1024).cuda()  
+                            image[k] = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())  
                         image[k][:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = v
                 for k in images.keys():
                     images[k].append(image[k])

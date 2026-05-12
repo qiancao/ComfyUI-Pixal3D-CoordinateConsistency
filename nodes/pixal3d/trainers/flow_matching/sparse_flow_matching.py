@@ -16,6 +16,7 @@ from .mixins.classifier_free_guidance import ClassifierFreeGuidanceMixin
 from .mixins.text_conditioned import TextConditionedMixin
 from .mixins.image_conditioned import ImageConditionedMixin, MultiImageConditionedMixin
 from .mixins.image_conditioned_proj import ImageConditionedProjMixin
+import comfy.model_management
 
 
 class SparseFlowMatchingTrainer(FlowMatchingTrainer):
@@ -589,7 +590,7 @@ class ImageConditionedProjSparseFlowMatchingCFGTrainer(ImageConditionedProjMixin
         
         # Get one batch
         data = next(iter(dataloader))
-        data = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in data.items()}
+        data = {k: v.to(comfy.model_management.get_torch_device()) if isinstance(v, torch.Tensor) else v for k, v in data.items()}
         
         # Extract condition image
         cond = data.get('cond')

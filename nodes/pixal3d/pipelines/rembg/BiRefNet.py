@@ -3,6 +3,7 @@ from transformers import AutoModelForImageSegmentation
 import torch
 from torchvision import transforms
 from PIL import Image
+import comfy.model_management
 
 
 class BiRefNet:
@@ -23,14 +24,14 @@ class BiRefNet:
         self.model.to(device)
 
     def cuda(self):
-        self.model.cuda()
+        self.model.to(comfy.model_management.get_torch_device())
 
     def cpu(self):
         self.model.cpu()
         
     def __call__(self, image: Image.Image) -> Image.Image:
         image_size = image.size
-        input_images = self.transform_image(image).unsqueeze(0).to("cuda")
+        input_images = self.transform_image(image).unsqueeze(0).to(comfy.model_management.get_torch_device())
         # Prediction
         with torch.no_grad():
             preds = self.model(input_images)[-1].sigmoid().cpu()

@@ -9,6 +9,7 @@ from ..renderers import MeshRenderer
 from ..representations import Mesh
 from ..utils.data_utils import load_balanced_group_indices
 import o_voxel
+import comfy.model_management
 
 
 class FlexiDualGridVisMixin:
@@ -33,9 +34,9 @@ class FlexiDualGridVisMixin:
                 np.sin(yaw) * np.cos(pitch),
                 np.cos(yaw) * np.cos(pitch),
                 np.sin(pitch),
-            ]).float().cuda() * 2
-            fov = torch.deg2rad(torch.tensor(30)).cuda()
-            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().cuda(), torch.tensor([0, 0, 1]).float().cuda())
+            ]).float().to(comfy.model_management.get_torch_device()) * 2
+            fov = torch.deg2rad(torch.tensor(30)).to(comfy.model_management.get_torch_device())
+            extrinsics = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().to(comfy.model_management.get_torch_device()), torch.tensor([0, 0, 1]).float().to(comfy.model_management.get_torch_device()))
             intrinsics = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
             exts.append(extrinsics)
             ints.append(intrinsics)
@@ -43,11 +44,11 @@ class FlexiDualGridVisMixin:
         # Build each representation
         images = []
         for m in mesh:
-            image = torch.zeros(3, 1024, 1024).cuda()
+            image = torch.zeros(3, 1024, 1024).to(comfy.model_management.get_torch_device())
             tile = [2, 2]
             for j, (ext, intr) in enumerate(zip(exts, ints)):
                 image[:, 512 * (j // tile[1]):512 * (j // tile[1] + 1), 512 * (j % tile[1]):512 * (j % tile[1] + 1)] = \
-                    renderer.render(m.cuda(), ext, intr)['normal']
+                    renderer.render(m.to(comfy.model_management.get_torch_device()), ext, intr)['normal']
             images.append(image)
         images = torch.stack(images)
         

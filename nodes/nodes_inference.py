@@ -1,4 +1,4 @@
-"""Pixal3D inference nodes — preprocess, camera, and the fused generate-to-GLB node."""
+"""Pixal3D inference nodes -- preprocess, camera, and the fused generate-to-GLB node."""
 
 import logging
 
@@ -99,8 +99,8 @@ class Pixal3DGenerateGLB(io.ComfyNode):
             category="Pixal3D",
             is_output_node=True,
             description=(
-                "Runs the four-stage cascade (sparse structure → shape LR 512 → "
-                "shape HR 1024 → texture 1024) and extracts a textured GLB. "
+                "Runs the four-stage cascade (sparse structure -> shape LR 512 -> "
+                "shape HR 1024 -> texture 1024) and extracts a textured GLB. "
                 "Cascade resolution can auto-shrink below the requested HR if the "
                 "token budget is exceeded; check logs."
             ),
