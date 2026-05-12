@@ -373,7 +373,9 @@ def _wrap_with_comfy_patcher(model):
     offload_device = comfy.model_management.unet_offload_device()
 
     # Build the patcher; the model stays on whatever device it's currently on
-    # (typically CPU after from_pretrained).
+    # (typically CPU after from_pretrained). Pixal3D's model classes now accept
+    # ComfyUI's `instance.device = X` bookkeeping (via the @device.setter we
+    # added in the vendored model files).
     patcher = comfy.model_patcher.ModelPatcher(
         model, load_device=load_device, offload_device=offload_device,
     )
@@ -403,11 +405,10 @@ def _wrap_with_comfy_patcher(model):
             try:
                 # Inform ComfyUI's memory manager (auto-offloads competing models).
                 comfy.model_management.load_models_gpu([patcher])
-                # ModelPatcher doesn't always physically move the wrapped module's
-                # parameters -- it manages cast/lowvram patches for its own forward
-                # mechanism. Pixal3D code accesses .weight directly via standard
-                # nn.Module attributes, so we must also call the real .to() to
-                # actually relocate the tensors.
+                # ComfyUI's ModelPatcher.load doesn't always physically relocate
+                # the wrapped module -- it manages cast/lowvram patches for its
+                # own forward path. Pixal3D accesses .weight directly, so we
+                # also call the real .to() to actually move tensors.
                 _orig_to(*args, **kwargs)
             finally:
                 _reentry.inside = False
@@ -495,6 +496,13 @@ def init_pipeline(attn_backend: str = "auto") -> "object":
         # between stages; we wrap each model so those calls go through ComfyUI's
         # memory manager (auto-offloads competing models, plays nice across nodes).
         pipeline.low_vram = True
+        # CRITICAL: tell the pipeline its target device. Pixal3DImageTo3DPipeline.to()
+        # with low_vram=True only sets `self._device` (no model movement -- good,
+        # we want the per-stage swap to handle moves). Without this, self.device
+        # stays 'cpu' from from_pretrained, get_proj_cond_ss reads it, and the
+        # subsequent `image_cond_model.to(self.device)` is .to('cpu') -- a no-op.
+        # The conv2d then fails with cuda-input vs cpu-weight.
+        pipeline.to(comfy.model_management.get_torch_device())
         with _phase("ModelPatcher wrap: 13 models"):
             _wrap_pipeline_models_with_patchers(pipeline)
 

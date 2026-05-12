@@ -164,6 +164,16 @@ class SparseStructureFlowModel(nn.Module):
         """
         return next(self.parameters()).device
 
+    @device.setter
+    def device(self, value):
+        """ComfyUI's ModelPatcher.load() does `self.model.device = device_to`
+        to stash bookkeeping. The property getter above always returns the
+        actual parameter device (derived), so this setter accepts the
+        assignment silently without changing semantics. Makes this class
+        conform to ComfyUI's BaseModel-style contract.
+        """
+        pass
+
     def convert_to(self, dtype: torch.dtype) -> None:
         """
         Convert the torso of the model to the specified dtype.
