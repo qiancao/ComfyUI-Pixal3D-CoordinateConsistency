@@ -10,7 +10,7 @@ import math
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 # Pixal3D's image-cond models call `torch.hub.load("valeoai/NAF", "naf", ...)` which
 # hits api.github.com for repo validation. If a bad GITHUB_TOKEN is in the env
@@ -28,6 +28,36 @@ import comfy.utils
 import folder_paths
 
 log = logging.getLogger("pixal3d")
+
+
+# ============================================================================
+# Per-phase timing print (visibility during the slow ~150 s cold-boot)
+# ============================================================================
+
+class _phase:
+    """Context manager that prints `[pixal3d] <label> ... <elapsed>s` on exit.
+
+    Writes to stderr with flush=True so ComfyUI's worker console surfaces it in
+    real time (its stdout is line-buffered for tqdm). Reports failures too.
+    """
+
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        import sys, time
+        self._t0 = time.perf_counter()
+        print(f"[pixal3d] >>> {self.label} ...", file=sys.stderr, flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        import sys, time
+        dt = time.perf_counter() - self._t0
+        if exc_type is None:
+            print(f"[pixal3d] <<< {self.label}  ({dt:.1f}s)", file=sys.stderr, flush=True)
+        else:
+            print(f"[pixal3d] !!! {self.label} FAILED after {dt:.1f}s: {exc_type.__name__}: {exc}", file=sys.stderr, flush=True)
+        return False  # don't swallow exceptions
 
 # ============================================================================
 # HuggingFace progress shim
@@ -66,6 +96,8 @@ def _comfy_tqdm():
 PIXAL3D_REPO = "TencentARC/Pixal3D"
 MOGE_REPO = "Ruicheng/moge-2-vitl"
 DINOV3_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
+NAF_REPO = "https://github.com/valeoai/NAF.git"
+NAF_CHECKPOINT_URL = "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth"
 
 IMAGE_COND_CONFIGS = {
     "ss": {
@@ -139,6 +171,8 @@ _moge_model = None
 # pixal3d's per-stage .to(device) / .cpu() calls through ComfyUI's memory
 # manager (load_models_gpu auto-offloads competing models in the workflow).
 _model_patchers: dict = {}
+# One nn.Module reused by all 3 cond extractors that need NAF upsampling.
+_naf = None
 
 
 # ============================================================================
@@ -181,6 +215,75 @@ def _download_pixal3d_weights():
             tqdm_class=tqdm_cls,
         )
     return local_dir
+
+
+def _download_naf() -> Tuple[Path, Path]:
+    """Ensure NAF source + checkpoint exist in ComfyUI/models/naf/.
+
+    Replaces torch.hub.load("valeoai/NAF", ...) which (a) hits api.github.com
+    on every cold boot, (b) caches under ~/.cache/torch/hub (off the
+    ComfyUI/models/ convention), (c) used to break under bad GITHUB_TOKEN env.
+
+    Returns (source_dir, ckpt_path). source_dir is added to sys.path so the
+    `NAF` class becomes importable as `src.model.naf.NAF`.
+    """
+    naf_dir = Path(folder_paths.models_dir) / "naf"
+    src_dir = naf_dir / "source"
+    ckpt = naf_dir / "naf_release.pth"
+    naf_dir.mkdir(parents=True, exist_ok=True)
+
+    if not (src_dir / "hubconf.py").exists():
+        import subprocess
+        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
+        subprocess.check_call(
+            ["git", "clone", "--depth", "1", NAF_REPO, str(src_dir)],
+            env=env,
+        )
+    if not ckpt.exists():
+        import urllib.request
+        urllib.request.urlretrieve(NAF_CHECKPOINT_URL, str(ckpt))
+    return src_dir, ckpt
+
+
+def _patch_naf_to_local_model():
+    """Monkey-patch DinoV3ProjFeatureExtractor._load_naf to (a) load NAF from
+    ComfyUI/models/naf/ instead of torch.hub, and (b) reuse ONE shared
+    nn.Module across all cond extractors that need it (currently 3 of 4:
+    shape_512, shape_1024, tex_1024). NAF has frozen weights and no
+    per-instance state, so sharing is safe.
+
+    Idempotent.
+    """
+    from .pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+        DinoV3ProjFeatureExtractor,
+    )
+    if getattr(DinoV3ProjFeatureExtractor, "_pixal3d_naf_patched", False):
+        return
+
+    src_dir, ckpt = _download_naf()
+    # Make `from src.model.naf import NAF` resolve from our local clone.
+    import sys
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+
+    def _patched_load_naf(self):
+        global _naf
+        if _naf is None:
+            with _phase("NAF model build + ckpt load"):
+                from src.model.naf import NAF  # noqa: F401  (resolved via sys.path)
+                m = NAF()
+                m.load_state_dict(torch.load(str(ckpt), map_location="cpu"))
+                m.eval()
+                m.requires_grad_(False)
+                _naf = m
+        # Bypass nn.Module __setattr__ so PyTorch doesn't register NAF as a
+        # child of every cond extractor (which would have each ModelPatcher
+        # try to manage the same weights). The forward path just calls
+        # `self.naf_model(...)`; attribute access still works.
+        self.__dict__["naf_model"] = _naf
+
+    DinoV3ProjFeatureExtractor._load_naf = _patched_load_naf
+    DinoV3ProjFeatureExtractor._pixal3d_naf_patched = True
 
 
 # ============================================================================
@@ -363,42 +466,45 @@ def init_pipeline(attn_backend: str = "auto") -> "object":
         return _pipeline
 
     _check_gpu_or_raise()
-    local_dir = _download_pixal3d_weights()
 
-    _patch_rembg_to_public_model()
-    _set_attention_backends(attn_backend)
+    with _phase("init_pipeline TOTAL"):
+        with _phase("download Pixal3D weights"):
+            local_dir = _download_pixal3d_weights()
 
-    from .pixal3d.pipelines import Pixal3DImageTo3DPipeline
-    from .pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
-        DinoV3ProjFeatureExtractor,
-    )
+        _patch_rembg_to_public_model()
+        _patch_naf_to_local_model()
+        _set_attention_backends(attn_backend)
 
-    log.info(f"[pixal3d] Loading pipeline from {local_dir}")
-    pipeline = Pixal3DImageTo3DPipeline.from_pretrained(str(local_dir))
+        from .pixal3d.pipelines import Pixal3DImageTo3DPipeline
+        from .pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
+            DinoV3ProjFeatureExtractor,
+        )
 
-    log.info("[pixal3d] Building DinoV3 cond models")
-    pipeline.image_cond_model_ss = _build_cond("ss")
-    pipeline.image_cond_model_shape_512 = _build_cond("shape_512")
-    pipeline.image_cond_model_shape_1024 = _build_cond("shape_1024")
-    pipeline.image_cond_model_tex_1024 = _build_cond("tex_1024")
+        with _phase("from_pretrained: 8 cascade safetensors -> CPU"):
+            pipeline = Pixal3DImageTo3DPipeline.from_pretrained(str(local_dir))
 
-    # Per-stage swap routed through ComfyUI's ModelPatcher / load_models_gpu.
-    # pixal3d's pipeline.run() already calls `model.to(device)` / `model.cpu()`
-    # between stages; we wrap each model so those calls go through ComfyUI's
-    # memory manager (auto-offloads competing models, plays nice across nodes).
-    pipeline.low_vram = True
-    _wrap_pipeline_models_with_patchers(pipeline)
+        for key in ("ss", "shape_512", "shape_1024", "tex_1024"):
+            with _phase(f"build DinoV3 cond '{key}'"):
+                setattr(pipeline, f"image_cond_model_{key}", _build_cond(key))
 
-    log.info("[pixal3d] Pre-loading NAF upsamplers")
-    for attr in (
-        "image_cond_model_ss",
-        "image_cond_model_shape_512",
-        "image_cond_model_shape_1024",
-        "image_cond_model_tex_1024",
-    ):
-        m = getattr(pipeline, attr, None)
-        if m is not None and getattr(m, "use_naf_upsample", False):
-            m._load_naf()
+        # Per-stage swap routed through ComfyUI's ModelPatcher / load_models_gpu.
+        # pixal3d's pipeline.run() already calls `model.to(device)` / `model.cpu()`
+        # between stages; we wrap each model so those calls go through ComfyUI's
+        # memory manager (auto-offloads competing models, plays nice across nodes).
+        pipeline.low_vram = True
+        with _phase("ModelPatcher wrap: 13 models"):
+            _wrap_pipeline_models_with_patchers(pipeline)
+
+        with _phase("NAF: build singleton + attach to 3 cond models"):
+            for attr in (
+                "image_cond_model_ss",
+                "image_cond_model_shape_512",
+                "image_cond_model_shape_1024",
+                "image_cond_model_tex_1024",
+            ):
+                m = getattr(pipeline, attr, None)
+                if m is not None and getattr(m, "use_naf_upsample", False):
+                    m._load_naf()
 
     _pipeline = pipeline
     return pipeline
@@ -429,11 +535,10 @@ def init_moge():
         return _moge_model
 
     _check_gpu_or_raise()
-    from moge.model.v2 import MoGeModel
-
-    log.info(f"[moge] Loading {MOGE_REPO}")
-    moge = MoGeModel.from_pretrained(MOGE_REPO).to(comfy.model_management.get_torch_device())
-    moge.eval()
+    with _phase("init_moge: MoGeModel.from_pretrained"):
+        from moge.model.v2 import MoGeModel
+        moge = MoGeModel.from_pretrained(MOGE_REPO).to(comfy.model_management.get_torch_device())
+        moge.eval()
     _moge_model = moge
     return moge
 
