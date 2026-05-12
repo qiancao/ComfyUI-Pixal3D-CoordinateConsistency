@@ -860,13 +860,17 @@ def generate_glb(
     if material is not None:
         tri.visual.material = material
 
-    # GLTF rotation (Y-up) — verbatim from inference.py:181
+    # Internal pixal3d/TRELLIS coords are Z-up; glTF is Y-up. Use the standard
+    # -90 deg rotation around X: (x, y, z) -> (x, z, -y). Matches TRELLIS2's
+    # export (nodes_unwrap.py:1325). The pixal3d inference.py:181 rotation also
+    # adds a 180 deg spin around Y (-x, -z, -y), which flips the model to face
+    # away from the camera in the glTF viewer -- we drop that spin.
     rot = np.array(
         [
-            [-1, 0, 0, 0],
+            [1, 0,  0, 0],
             [0, 0, -1, 0],
-            [0, -1, 0, 0],
-            [0, 0, 0, 1],
+            [0, 1,  0, 0],
+            [0, 0,  0, 1],
         ],
         dtype=np.float64,
     )
