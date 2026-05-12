@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.idea/
+.vscode/
+
+# isolated env build markers
+_env_*
+.pixi/
+
+# autotune caches
+autotune_cache.json
+
+# local-only checkpoints (huge; downloaded at runtime)
+models/
