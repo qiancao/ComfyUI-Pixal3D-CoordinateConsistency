@@ -35,10 +35,10 @@ class Pixal3DPreprocessImage(io.ComfyNode):
 
     @classmethod
     def execute(cls, image, bg_r: int = 0, bg_g: int = 0, bg_b: int = 0):
-        from .stages import preprocess_image
-
-        out = preprocess_image(image, bg_color=(bg_r, bg_g, bg_b))
-        return io.NodeOutput(out)
+        from .stages import preprocess_image, _phase
+        with _phase("Pixal3DPreprocessImage.execute"):
+            out = preprocess_image(image, bg_color=(bg_r, bg_g, bg_b))
+            return io.NodeOutput(out)
 
 
 class Pixal3DEstimateCamera(io.ComfyNode):
@@ -73,19 +73,19 @@ class Pixal3DEstimateCamera(io.ComfyNode):
         extend_pixel: int = 0,
         image_resolution: int = 512,
     ):
-        from .stages import estimate_camera
-
-        cam = estimate_camera(
-            image,
-            mesh_scale=mesh_scale,
-            extend_pixel=extend_pixel,
-            image_resolution=image_resolution,
-        )
-        log.info(
-            f"[Pixal3DEstimateCamera] camera_angle_x={cam['camera_angle_x']:.4f}, "
-            f"distance={cam['distance']:.4f}, mesh_scale={cam['mesh_scale']:.4f}"
-        )
-        return io.NodeOutput(cam)
+        from .stages import estimate_camera, _phase
+        with _phase("Pixal3DEstimateCamera.execute"):
+            cam = estimate_camera(
+                image,
+                mesh_scale=mesh_scale,
+                extend_pixel=extend_pixel,
+                image_resolution=image_resolution,
+            )
+            log.info(
+                f"[Pixal3DEstimateCamera] camera_angle_x={cam['camera_angle_x']:.4f}, "
+                f"distance={cam['distance']:.4f}, mesh_scale={cam['mesh_scale']:.4f}"
+            )
+            return io.NodeOutput(cam)
 
 
 class Pixal3DGenerateGLB(io.ComfyNode):
@@ -170,34 +170,36 @@ class Pixal3DGenerateGLB(io.ComfyNode):
         force_opaque: bool = True,
         filename_prefix: str = "pixal3d",
     ):
-        from .stages import generate_glb
+        from .stages import generate_glb, _phase
+        with _phase("Pixal3DGenerateGLB.execute"):
+            pipeline_type = pipeline.get("pipeline_type", "1024_cascade")
+            attn_backend = pipeline.get("attn_backend", "auto")
 
-        pipeline_type = pipeline.get("pipeline_type", "1024_cascade")
-
-        out = generate_glb(
-            image=image,
-            camera_params=camera,
-            seed=seed,
-            pipeline_type=pipeline_type,
-            max_num_tokens=max_num_tokens,
-            ss_steps=ss_steps,
-            ss_guidance=ss_guidance,
-            ss_rescale=ss_rescale,
-            ss_rescale_t=ss_rescale_t,
-            shape_steps=shape_steps,
-            shape_guidance=shape_guidance,
-            shape_rescale=shape_rescale,
-            shape_rescale_t=shape_rescale_t,
-            tex_steps=tex_steps,
-            tex_guidance=tex_guidance,
-            tex_rescale=tex_rescale,
-            force_opaque=force_opaque,
-            tex_rescale_t=tex_rescale_t,
-            decimation_target=decimation_target,
-            texture_size=texture_size,
-            filename_prefix=filename_prefix,
-        )
-        return io.NodeOutput(out)
+            out = generate_glb(
+                image=image,
+                camera_params=camera,
+                seed=seed,
+                pipeline_type=pipeline_type,
+                attn_backend=attn_backend,
+                max_num_tokens=max_num_tokens,
+                ss_steps=ss_steps,
+                ss_guidance=ss_guidance,
+                ss_rescale=ss_rescale,
+                ss_rescale_t=ss_rescale_t,
+                shape_steps=shape_steps,
+                shape_guidance=shape_guidance,
+                shape_rescale=shape_rescale,
+                shape_rescale_t=shape_rescale_t,
+                tex_steps=tex_steps,
+                tex_guidance=tex_guidance,
+                tex_rescale=tex_rescale,
+                force_opaque=force_opaque,
+                tex_rescale_t=tex_rescale_t,
+                decimation_target=decimation_target,
+                texture_size=texture_size,
+                filename_prefix=filename_prefix,
+            )
+            return io.NodeOutput(out)
 
 
 NODE_CLASS_MAPPINGS = {

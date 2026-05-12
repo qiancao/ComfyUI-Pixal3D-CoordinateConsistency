@@ -58,14 +58,15 @@ class Pixal3DLoadPipeline(io.ComfyNode):
         pipeline_type: str = "1024_cascade",
         attn_backend: str = "auto",
     ):
-        from .stages import init_pipeline
-
-        init_pipeline(attn_backend=attn_backend)
-        # Sentinel -- pipeline lives in module-level cache.
-        return io.NodeOutput({
-            "pipeline_type": pipeline_type,
-            "attn_backend": attn_backend,
-        })
+        from .stages import _phase
+        with _phase("Pixal3DLoadPipeline.execute"):
+            # Thin: just emit a config dict. The actual model load is lazy and
+            # fires from Pixal3DGenerateGLB (and Pixal3DPreprocessImage if the
+            # workflow runs rembg). Matches TRELLIS2's LoadTrellis2Models pattern.
+            return io.NodeOutput({
+                "pipeline_type": pipeline_type,
+                "attn_backend": attn_backend,
+            })
 
 
 NODE_CLASS_MAPPINGS = {

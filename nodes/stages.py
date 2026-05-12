@@ -641,6 +641,7 @@ def generate_glb(
     camera_params: dict,
     seed: int = 42,
     pipeline_type: str = "1024_cascade",
+    attn_backend: str = "auto",
     max_num_tokens: int = 49152,
     # Sampler knobs (defaults match inference.py)
     ss_steps: int = 12,
@@ -664,7 +665,7 @@ def generate_glb(
     filename_prefix: str = "pixal3d",
 ) -> str:
     """Run cascade + extract GLB. Returns absolute path to the saved GLB."""
-    pipeline = init_pipeline()
+    pipeline = init_pipeline(attn_backend=attn_backend)
 
     pil = comfy_image_to_pil(image)
 
