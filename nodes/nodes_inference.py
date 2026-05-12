@@ -133,9 +133,30 @@ class Pixal3DGenerateGLB(io.ComfyNode):
                     "force_opaque",
                     default=True,
                     tooltip=(
-                        "Set every vertex alpha to 1.0 (fully opaque) in the exported GLB. "
-                        "Useful when the model emits low-alpha vertices that render as see-through. "
-                        "Untoggle to keep the per-vertex alpha from the texture voxel grid."
+                        "Emit COLOR_0 as VEC3 (no alpha channel at all). Most viewers default "
+                        "to opaque when no alpha is present. Untoggle to emit VEC4 + a "
+                        "PBRMaterial(alphaMode=BLEND) using the model's per-vertex alpha."
+                    ),
+                    optional=True,
+                ),
+                io.Boolean.Input(
+                    "double_sided",
+                    default=False,
+                    tooltip=(
+                        "Mark the material as double-sided in the GLB (renders both front "
+                        "and back faces). Useful for thin shells (foliage, glass) or "
+                        "shapes with residual inverted faces. Default off, mirroring TRELLIS2."
+                    ),
+                    optional=True,
+                ),
+                io.Boolean.Input(
+                    "remove_inner_faces",
+                    default=False,
+                    tooltip=(
+                        "After winding cleanup, run BVH raystab on each face's outward-offset "
+                        "center and drop faces whose interior lies inside the bulk. Useful when "
+                        "the cascade emits floaters or internal cavity walls. Costs ~2-5s "
+                        "extra on a 200k-face mesh."
                     ),
                     optional=True,
                 ),
@@ -169,6 +190,8 @@ class Pixal3DGenerateGLB(io.ComfyNode):
         decimation_target: int = 200000,
         texture_size: int = 2048,
         force_opaque: bool = True,
+        double_sided: bool = False,
+        remove_inner_faces: bool = False,
         filename_prefix: str = "pixal3d",
     ):
         from .stages import generate_glb, _phase
@@ -195,6 +218,8 @@ class Pixal3DGenerateGLB(io.ComfyNode):
                 tex_guidance=tex_guidance,
                 tex_rescale=tex_rescale,
                 force_opaque=force_opaque,
+                double_sided=double_sided,
+                remove_inner_faces=remove_inner_faces,
                 tex_rescale_t=tex_rescale_t,
                 decimation_target=decimation_target,
                 texture_size=texture_size,

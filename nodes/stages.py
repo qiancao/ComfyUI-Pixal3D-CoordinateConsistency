@@ -746,6 +746,8 @@ def generate_glb(
     pre_simplify: bool = True,
     pre_simplify_target_faces: int = 2_000_000,
     force_opaque: bool = True,
+    double_sided: bool = False,
+    remove_inner_faces: bool = False,
     filename_prefix: str = "pixal3d",
 ) -> str:
     """Run cascade + extract GLB. Returns absolute path to the saved GLB."""
@@ -814,6 +816,53 @@ def generate_glb(
         mesh.vertices = verts.float()
         mesh.faces = faces.int()
 
+    if remove_inner_faces:
+        # BVH-based interior-face removal. Pattern adapted from TRELLIS2
+        # (nodes_unwrap.py:898-938): build a BVH on the (unify-oriented) mesh,
+        # push each face center outward along its normal by a small fraction of
+        # the bbox diagonal, then raystab-classify the offset point. Outward
+        # push from an interior face lands inside the bulk (SDF < 0) so it gets
+        # culled; from an exterior face it lands in empty space (SDF > 0).
+        with _phase("cumesh: remove_inner_faces (BVH raystab)"):
+            import cumesh as _cumesh
+            device = comfy.model_management.get_torch_device()
+            v = verts.to(device).float().contiguous()
+            f = faces.to(device).int().contiguous()
+            face_v = v[f.long()]                 # [F, 3, 3]
+            face_centers = face_v.mean(dim=1)    # [F, 3]
+            e1 = face_v[:, 1] - face_v[:, 0]
+            e2 = face_v[:, 2] - face_v[:, 0]
+            face_normals = torch.nn.functional.normalize(torch.cross(e1, e2, dim=-1), dim=-1)
+            bbox_diag = float((v.amax(0) - v.amin(0)).norm())
+            eps = bbox_diag * 1e-3
+            test_pts = face_centers + face_normals * eps
+            bvh = _cumesh.cuBVH(v, f)
+            # signed_distance returns (sdf, ...); raystab mode classifies via
+            # random-ray parity, robust against the BVH's own surface noise at
+            # this offset scale.
+            sdf_chunk = 524_288
+            sdf = torch.empty(test_pts.shape[0], dtype=torch.float32, device=device)
+            for i in range(0, test_pts.shape[0], sdf_chunk):
+                end = min(i + sdf_chunk, test_pts.shape[0])
+                sdf[i:end] = bvh.signed_distance(test_pts[i:end], mode="raystab")[0]
+            keep = sdf >= -eps * 0.1
+            n_total = int(f.shape[0])
+            n_removed = int((~keep).sum().item())
+            log.info(f"[pixal3d] remove_inner_faces: dropped {n_removed}/{n_total} faces")
+            kept_faces = f[keep]
+            used = torch.zeros(v.shape[0], dtype=torch.bool, device=device)
+            used[kept_faces.flatten().long()] = True
+            old_to_new = torch.full((v.shape[0],), -1, dtype=torch.long, device=device)
+            old_to_new[used] = torch.arange(int(used.sum()), device=device)
+            new_verts = v[used]
+            new_faces = old_to_new[kept_faces.long()].int()
+            verts = new_verts.contiguous()
+            faces = new_faces.contiguous()
+            mesh.vertices = verts.float()
+            mesh.faces = faces.int()
+            del bvh, face_v, face_centers, face_normals, e1, e2, test_pts, sdf, keep, used, old_to_new
+            torch.cuda.empty_cache()
+
     with torch.no_grad():
         vattrs = mesh.query_vertex_attrs()  # [N, C], C covers base_color/metallic/roughness/alpha
     base_color_slice = pipeline.pbr_attr_layout.get("base_color", slice(0, 3))
@@ -823,15 +872,25 @@ def generate_glb(
 
     material = None
     if force_opaque:
-        # 3-channel COLOR_0 (VEC3). No alpha attribute in the glTF at all, so
-        # three.js / model-viewer / etc. can't auto-switch to BLEND mode based
-        # on a "present" alpha channel. Cleanest opaque output.
+        # 3-channel COLOR_0 (VEC3). No alpha attribute in the glTF, so
+        # three.js / model-viewer can't auto-switch to BLEND mode based on
+        # presence of alpha. Cleanest opaque output.
         vertex_colors = rgb
+        if double_sided:
+            # Explicit material only when we need to force doubleSided -- a
+            # plain VEC3 vertex-color GLB without a material defaults to
+            # doubleSided=False in most viewers, so this is the only path.
+            material = trimesh.visual.material.PBRMaterial(
+                name="pixal3d_opaque_double_sided",
+                alphaMode="OPAQUE",
+                doubleSided=True,
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+            )
     elif alpha_slice is not None:
-        # 4-channel COLOR_0 (VEC4) + explicit PBRMaterial(alphaMode=BLEND,
-        # doubleSided=True). three.js GLTFLoader honors the material's
-        # alphaMode and does proper depth-sorted translucency. doubleSided
-        # so thin shells (glass, foliage) render from both sides.
+        # 4-channel COLOR_0 (VEC4) + explicit PBRMaterial(alphaMode=BLEND).
+        # three.js GLTFLoader honors the material's alphaMode and does proper
+        # depth-sorted translucency.
         a = vattrs[:, alpha_slice].clamp(0.0, 1.0).cpu().numpy()
         a = (a * 255).astype(np.uint8)
         if a.ndim == 2 and a.shape[1] == 1:
@@ -844,12 +903,20 @@ def generate_glb(
         material = trimesh.visual.material.PBRMaterial(
             name="pixal3d_translucent",
             alphaMode="BLEND",
-            doubleSided=True,
+            doubleSided=double_sided,
             metallicFactor=0.0,
             roughnessFactor=1.0,
         )
     else:
         vertex_colors = rgb  # pipeline has no alpha layout key -- treat as opaque
+        if double_sided:
+            material = trimesh.visual.material.PBRMaterial(
+                name="pixal3d_opaque_double_sided",
+                alphaMode="OPAQUE",
+                doubleSided=True,
+                metallicFactor=0.0,
+                roughnessFactor=1.0,
+            )
 
     tri = trimesh.Trimesh(
         vertices=verts.cpu().numpy(),
