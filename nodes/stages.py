@@ -1240,11 +1240,16 @@ def rasterize_pbr(
 # ----------------------------------------------------------------------------
 
 _GLB_YUP_ROT = np.array(
-    # Z-up -> Y-up: (x, y, z) -> (x, z, -y). Matches TRELLIS2 nodes_unwrap.py:1325.
-    [[1, 0,  0, 0],
-     [0, 0, -1, 0],
-     [0, 1,  0, 0],
-     [0, 0,  0, 1]],
+    # Z-up -> Y-up rotation (-90 deg around X): (x, y, z) -> (x, z, -y).
+    # Applied as v' = M @ v on homogeneous column vectors, so:
+    #   row 1 picks z  -> new_y =  old_z
+    #   row 2 picks -y -> new_z = -old_y
+    # Matches TRELLIS2 nodes_unwrap.py:1325 verbatim assignment
+    #   vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+    [[1,  0, 0, 0],
+     [0,  0, 1, 0],
+     [0, -1, 0, 0],
+     [0,  0, 0, 1]],
     dtype=np.float64,
 )
 
