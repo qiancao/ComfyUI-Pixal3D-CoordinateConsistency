@@ -8,6 +8,7 @@ import gc
 import logging
 import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -272,7 +273,7 @@ def _patch_naf_to_local_model():
             with _phase("NAF model build + ckpt load"):
                 from src.model.naf import NAF  # noqa: F401  (resolved via sys.path)
                 m = NAF()
-                m.load_state_dict(torch.load(str(ckpt), map_location="cpu"))
+                m.load_state_dict(comfy.utils.load_torch_file(str(ckpt), safe_load=True))
                 m.eval()
                 m.requires_grad_(False)
                 _naf = m
@@ -717,8 +718,823 @@ def estimate_camera(
 
 
 # ============================================================================
-# Generate + Extract GLB (fused for MVP — keeps SparseTensors out of IPC)
+# Cascade + GLB export, split into composable helpers.
+#
+# The cascade returns an internal-coords (Z-up, [-0.5, 0.5]^3) DC mesh + a
+# sparse PBR voxel grid. From there two output paths:
+#
+#   1) Monolithic vertex-color path (generate_glb): light cleanup, query
+#      per-vertex PBR from the voxel grid, write a vertex-colored GLB. Fast,
+#      no UV unwrap, lower texture fidelity.
+#   2) Split UV-bake path (generate_mesh_and_voxelgrid -> process_mesh ->
+#      rasterize_pbr -> export_glb): heavy cleanup + UV unwrap + drtk UV-space
+#      rasterize + BVH-snap + grid_sample_3d + cv2.inpaint + bake baseColor +
+#      metallic/roughness textures. Matches upstream o_voxel.postprocess.to_glb
+#      (which our o_voxel_vb_ap fork strips, since it depended on nvdiffrast).
+#      Ports of TRELLIS2's Trellis2ProcessMesh / Trellis2RasterizePBR.
+#
+# IPC contract: TRIMESH = trimesh.Trimesh (CPU numpy). PIXAL3D_VOXELGRID = dict
+# of numpy arrays / floats / dict-of-slices. Both pickle cleanly across the
+# comfy-env boundary.
 # ============================================================================
+
+
+def _run_cascade(
+    image: torch.Tensor,
+    camera_params: dict,
+    seed: int,
+    pipeline_type: str,
+    attn_backend: str,
+    max_num_tokens: int,
+    ss_steps: int, ss_guidance: float, ss_rescale: float, ss_rescale_t: float,
+    shape_steps: int, shape_guidance: float, shape_rescale: float, shape_rescale_t: float,
+    tex_steps: int, tex_guidance: float, tex_rescale: float, tex_rescale_t: float,
+):
+    """Run the 4-stage cascade. Returns (pipeline, MeshWithVoxel, resolution)."""
+    pipeline = init_pipeline(attn_backend=attn_backend)
+    pil = comfy_image_to_pil(image)
+    torch.manual_seed(seed)
+    log.info(f"[pixal3d] Running cascade ({pipeline_type}, seed={seed})")
+    mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
+        pil,
+        camera_params=camera_params,
+        seed=seed,
+        sparse_structure_sampler_params={
+            "steps": ss_steps, "guidance_strength": ss_guidance,
+            "guidance_rescale": ss_rescale, "rescale_t": ss_rescale_t,
+        },
+        shape_slat_sampler_params={
+            "steps": shape_steps, "guidance_strength": shape_guidance,
+            "guidance_rescale": shape_rescale, "rescale_t": shape_rescale_t,
+        },
+        tex_slat_sampler_params={
+            "steps": tex_steps, "guidance_strength": tex_guidance,
+            "guidance_rescale": tex_rescale, "rescale_t": tex_rescale_t,
+        },
+        preprocess_image=False,
+        return_latent=True,
+        pipeline_type=pipeline_type,
+        max_num_tokens=max_num_tokens,
+    )
+    mw = mesh_list[0]
+    log.info(f"[pixal3d] Mesh extracted at resolution {res}")
+    del shape_slat, tex_slat, mesh_list
+    return pipeline, mw, int(res)
+
+
+def _meshwithvoxel_to_dict(mw, pipeline) -> dict:
+    """Serialize a MeshWithVoxel's voxel side into an IPC-safe dict."""
+    origin = mw.origin
+    if hasattr(origin, "detach"):
+        origin = origin.detach().cpu().tolist()
+    else:
+        origin = list(origin)
+    # MeshWithVoxel.voxel_shape is torch.Size([1, C, X, Y, Z]) -- the full 5D shape
+    # that grid_sample_3d expects directly. We store ONLY the 3D spatial extent here;
+    # downstream consumers (_query_vertex_pbr, rasterize_pbr) rebuild the 5D shape as
+    # torch.Size([1, attrs.shape[1], *voxel_shape]) at call time. Matches TRELLIS2's
+    # 'grid_size' convention.
+    full_shape = tuple(int(x) for x in mw.voxel_shape)
+    spatial_shape = full_shape[-3:]
+    return {
+        "attrs": mw.attrs.detach().cpu().numpy(),                  # [N, C] float
+        "coords": mw.coords.detach().cpu().numpy().astype(np.float32),  # [N, 3] voxel idx
+        "voxel_size": float(mw.voxel_size),
+        "voxel_shape": spatial_shape,                              # (X, Y, Z) only
+        "origin": origin,
+        "pbr_attr_layout": dict(pipeline.pbr_attr_layout),
+    }
+
+
+def _trimesh_from_meshwithvoxel(mw):
+    """Wrap MeshWithVoxel's geometry in a plain CPU trimesh.Trimesh (no material)."""
+    import trimesh as Trimesh
+    return Trimesh.Trimesh(
+        vertices=mw.vertices.detach().cpu().numpy().astype(np.float32),
+        faces=mw.faces.detach().cpu().numpy().astype(np.int32),
+        process=False,
+    )
+
+
+def _light_clean(tri, remove_inner_faces: bool = False):
+    """In-place cumesh cleanup: dedup + repair_non_manifold + unify_face_orientations,
+    plus optional BVH-raystab inner-face removal. Updates tri.vertices / tri.faces
+    and returns the same trimesh."""
+    import cumesh
+    import trimesh as Trimesh
+    device = comfy.model_management.get_torch_device()
+    verts = torch.tensor(tri.vertices, dtype=torch.float32, device=device).contiguous()
+    faces = torch.tensor(tri.faces, dtype=torch.int32, device=device).contiguous()
+
+    with _phase("light_clean: dedup + repair + unify"):
+        cm = cumesh.CuMesh()
+        cm.init(verts, faces)
+        cm.remove_duplicate_faces()
+        cm.repair_non_manifold_edges()
+        cm.unify_face_orientations()
+        verts, faces = cm.read()
+        del cm
+
+    if remove_inner_faces:
+        with _phase("light_clean: remove_inner_faces (BVH raystab)"):
+            v = verts.float().contiguous()
+            f = faces.int().contiguous()
+            face_v = v[f.long()]
+            face_centers = face_v.mean(dim=1)
+            e1 = face_v[:, 1] - face_v[:, 0]
+            e2 = face_v[:, 2] - face_v[:, 0]
+            face_normals = torch.nn.functional.normalize(torch.cross(e1, e2, dim=-1), dim=-1)
+            bbox_diag = float((v.amax(0) - v.amin(0)).norm())
+            eps = bbox_diag * 1e-3
+            test_pts = face_centers + face_normals * eps
+            bvh = cumesh.cuBVH(v, f)
+            sdf_chunk = 524_288
+            sdf = torch.empty(test_pts.shape[0], dtype=torch.float32, device=device)
+            for i in range(0, test_pts.shape[0], sdf_chunk):
+                end = min(i + sdf_chunk, test_pts.shape[0])
+                sdf[i:end] = bvh.signed_distance(test_pts[i:end], mode="raystab")[0]
+            keep = sdf >= -eps * 0.1
+            n_total = int(f.shape[0])
+            n_removed = int((~keep).sum().item())
+            log.info(f"[pixal3d] remove_inner_faces: dropped {n_removed}/{n_total} faces")
+            kept_faces = f[keep]
+            used = torch.zeros(v.shape[0], dtype=torch.bool, device=device)
+            used[kept_faces.flatten().long()] = True
+            old_to_new = torch.full((v.shape[0],), -1, dtype=torch.long, device=device)
+            old_to_new[used] = torch.arange(int(used.sum()), device=device)
+            verts = v[used]
+            faces = old_to_new[kept_faces.long()].int()
+            del bvh, face_v, face_centers, face_normals, e1, e2, test_pts, sdf, keep, used, old_to_new
+            torch.cuda.empty_cache()
+
+    cleaned = Trimesh.Trimesh(
+        vertices=verts.detach().cpu().numpy().astype(np.float32),
+        faces=faces.detach().cpu().numpy().astype(np.int32),
+        process=False,
+    )
+    return cleaned
+
+
+def _query_vertex_pbr(tri, voxelgrid: dict) -> np.ndarray:
+    """Trilinearly sample the sparse PBR voxel grid at each mesh vertex.
+    Returns [N, C] numpy float in [0, 1]."""
+    from flex_gemm_ap.ops.grid_sample import grid_sample_3d
+    device = comfy.model_management.get_torch_device()
+    attrs = torch.from_numpy(voxelgrid["attrs"]).to(device)
+    coords = torch.from_numpy(voxelgrid["coords"]).to(device)
+    voxel_shape = voxelgrid["voxel_shape"]
+    origin = torch.tensor(voxelgrid["origin"], dtype=torch.float32, device=device)
+    voxel_size = float(voxelgrid["voxel_size"])
+    verts = torch.tensor(tri.vertices, dtype=torch.float32, device=device)
+    grid = ((verts - origin) / voxel_size).reshape(1, -1, 3)
+    coords_padded = torch.cat([torch.zeros_like(coords[..., :1]), coords], dim=-1)
+    vattrs = grid_sample_3d(
+        attrs,
+        coords_padded,
+        torch.Size([1, attrs.shape[1], *voxel_shape]),
+        grid,
+        mode="trilinear",
+    )[0]
+    return vattrs.clamp(0.0, 1.0).detach().cpu().numpy()
+
+
+def _bake_vertex_colors(tri, voxelgrid: dict, force_opaque: bool, double_sided: bool):
+    """Attach vertex colors (+ optional PBRMaterial) to tri. Returns the updated mesh."""
+    import trimesh as Trimesh
+    layout = voxelgrid["pbr_attr_layout"]
+    vattrs = _query_vertex_pbr(tri, voxelgrid)
+    rgb = (vattrs[:, layout.get("base_color", slice(0, 3))] * 255).astype(np.uint8)
+    alpha_slice = layout.get("alpha", None)
+
+    material = None
+    if force_opaque:
+        vertex_colors = rgb
+        if double_sided:
+            material = Trimesh.visual.material.PBRMaterial(
+                name="pixal3d_opaque_double_sided",
+                alphaMode="OPAQUE", doubleSided=True,
+                metallicFactor=0.0, roughnessFactor=1.0,
+            )
+    elif alpha_slice is not None:
+        a = (vattrs[:, alpha_slice] * 255).astype(np.uint8)
+        if a.ndim == 2 and a.shape[1] == 1:
+            a = a[:, 0]
+        vertex_colors = np.concatenate([rgb, a[:, None]], axis=1)
+        material = Trimesh.visual.material.PBRMaterial(
+            name="pixal3d_translucent",
+            alphaMode="BLEND", doubleSided=double_sided,
+            metallicFactor=0.0, roughnessFactor=1.0,
+        )
+    else:
+        vertex_colors = rgb
+        if double_sided:
+            material = Trimesh.visual.material.PBRMaterial(
+                name="pixal3d_opaque_double_sided",
+                alphaMode="OPAQUE", doubleSided=True,
+                metallicFactor=0.0, roughnessFactor=1.0,
+            )
+
+    out = Trimesh.Trimesh(
+        vertices=tri.vertices, faces=tri.faces,
+        vertex_colors=vertex_colors,
+        process=False,
+    )
+    if material is not None:
+        out.visual.material = material
+    return out
+
+
+# ----------------------------------------------------------------------------
+# UV-bake path: ports of TRELLIS2's Trellis2ProcessMesh / Trellis2RasterizePBR.
+# ----------------------------------------------------------------------------
+
+
+def _dbg(msg: str) -> None:
+    """Single-line stderr-flushed debug print, prefixed for grep-ability."""
+    print(f"[pixal3d:dbg] {msg}", file=sys.stderr, flush=True)
+
+
+def _log_mesh_stats(label: str, cm) -> None:
+    """Print cumesh state after a step. Cheap (just reads counters)."""
+    try:
+        _dbg(f"  {label}: {cm.num_vertices} verts / {cm.num_faces} faces")
+    except Exception as e:
+        _dbg(f"  {label}: could not read cumesh stats ({e})")
+
+
+def _rasterize_uv(vertices, faces, uvs, texture_size, device, debug=False):
+    """drtk port of nvdiffrast's UV-space rasterize+interpolate.
+    Returns (mask: [S,S] bool, valid_pos: [N, 3] float, face_ids: [N] long,
+             bary_masked: [N, 3] float, rast_face_ids: [S, S] int32) -- the
+    last entry is the per-texel face id image, preserved for debug dumps.
+    Mirrors trellis2/nodes_unwrap.py:1026."""
+    import drtk
+    chunk_size = 100_000
+    S = int(texture_size)
+    if debug:
+        _dbg(f"_rasterize_uv: V={uvs.shape[0]}, F={faces.shape[0]}, S={S}")
+        _dbg(f"  UV bbox: min={uvs.amin(dim=0).tolist()}, max={uvs.amax(dim=0).tolist()}")
+        _dbg(f"  vert bbox: min={vertices.amin(dim=0).tolist()}, max={vertices.amax(dim=0).tolist()}")
+    verts_uv = torch.stack([
+        uvs[:, 0] * S - 0.5,
+        uvs[:, 1] * S - 0.5,
+        torch.ones(uvs.shape[0], device=device),
+    ], dim=-1).float().unsqueeze(0)  # [1, V, 3]
+
+    rast_face_ids = torch.full((S, S), -1, dtype=torch.int32, device=device)
+    for i in range(0, faces.shape[0], chunk_size):
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        chunk_vi = faces[i:i + chunk_size].int()
+        index_img = drtk.rasterize(verts_uv, chunk_vi, height=S, width=S)
+        chunk_hit = index_img[0] >= 0
+        rast_face_ids[chunk_hit] = (index_img[0][chunk_hit] + i).int()
+        del index_img, chunk_hit
+
+    mask = rast_face_ids >= 0
+    _, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
+    bary = bary_img[0].permute(1, 2, 0)
+    bary_masked = bary[mask]
+    face_ids = rast_face_ids[mask].long()
+    face_verts = vertices[faces[face_ids].long()]
+    valid_pos = (face_verts * bary_masked.unsqueeze(-1)).sum(dim=1)
+
+    if debug:
+        cov = mask.sum().item() / mask.numel()
+        n_distinct = int(torch.unique(rast_face_ids[mask]).numel()) if mask.any() else 0
+        _dbg(f"  rasterized: coverage={cov:.1%}, distinct face_ids={n_distinct}/{faces.shape[0]}")
+        _dbg(f"  bary range: [{bary_masked.min().item():.4f}, {bary_masked.max().item():.4f}]")
+        if valid_pos.numel():
+            _dbg(f"  valid_pos bbox: min={valid_pos.amin(dim=0).tolist()}, max={valid_pos.amax(dim=0).tolist()}")
+
+    # Keep rast_face_ids alive for caller if debug dump is on.
+    rast_face_ids_out = rast_face_ids.clone() if debug else None
+    del verts_uv, rast_face_ids, bary_img, bary, face_verts
+    comfy.model_management.soft_empty_cache()
+    return mask, valid_pos, face_ids, bary_masked, rast_face_ids_out
+
+
+def process_mesh(
+    tri,
+    remesh: bool = False,
+    remesh_band: float = 1.0,
+    remesh_resolution: int = 512,
+    fill_holes: bool = True,
+    fill_holes_perimeter: float = 0.03,
+    floater_threshold: float = 1e-3,
+    target_face_count: int = 200_000,
+    remove_inner_faces: bool = False,
+    weld_vertices: bool = True,
+    weld_digits: int = 4,
+    chart_cone_angle: float = 90.0,
+    chart_refine_iterations: int = 0,
+    chart_global_iterations: int = 1,
+    chart_smooth_strength: int = 1,
+):
+    """Heavy mesh cleanup + UV unwrap. Port of TRELLIS2 Trellis2ProcessMesh.execute().
+    Returns a trimesh.Trimesh with .visual.uv set and vertex_normals populated."""
+    import cumesh as CuMesh
+    import trimesh as Trimesh
+
+    device = comfy.model_management.get_torch_device()
+    _dbg(f"process_mesh: in {len(tri.vertices)} verts / {len(tri.faces)} faces, target {target_face_count}")
+    in_v = np.asarray(tri.vertices)
+    _dbg(f"  vert bbox: min={in_v.min(axis=0).tolist()}, max={in_v.max(axis=0).tolist()}")
+
+    verts = torch.tensor(tri.vertices, dtype=torch.float32, device=device)
+    faces = torch.tensor(tri.faces, dtype=torch.int32, device=device)
+
+    with _phase("process_mesh: cumesh.init"):
+        cm = CuMesh.CuMesh()
+        cm.init(verts, faces)
+        del verts, faces
+    _log_mesh_stats("after init", cm)
+
+    if remesh:
+        with _phase("process_mesh: DC remesh"):
+            curr_v, curr_f = cm.read()
+            aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], device=device)
+            center = aabb.mean(dim=0)
+            scale = (aabb[1] - aabb[0]).max().item()
+            cm.init(*CuMesh.remeshing.remesh_narrow_band_dc_quad(
+                curr_v, curr_f,
+                center=center,
+                scale=scale * 1.1,
+                resolution=remesh_resolution,
+                band=remesh_band,
+                project_back=0.0,
+                verbose=True,
+                remove_inner_faces=remove_inner_faces,
+            ))
+            del curr_v, curr_f
+        _log_mesh_stats("after DC remesh", cm)
+
+    if floater_threshold > 0:
+        with _phase(f"process_mesh: remove_small_connected_components({floater_threshold})"):
+            cm.remove_small_connected_components(floater_threshold)
+        _log_mesh_stats(f"after remove_small_cc({floater_threshold})", cm)
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+
+    if not remesh:
+        # 2-pass simplify pattern from upstream to_glb.
+        with _phase("process_mesh: 2-pass simplify + cleanup"):
+            cm.remove_duplicate_faces()
+            cm.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cm.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cm.fill_holes(max_hole_perimeter=fill_holes_perimeter)
+            _log_mesh_stats("cleanup pass 1", cm)
+            cm.simplify(target_face_count * 3, verbose=True)
+            _log_mesh_stats(f"after simplify({target_face_count * 3})", cm)
+            cm.remove_duplicate_faces()
+            cm.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cm.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cm.fill_holes(max_hole_perimeter=fill_holes_perimeter)
+            cm.simplify(target_face_count, verbose=True)
+            _log_mesh_stats(f"after simplify({target_face_count})", cm)
+            cm.remove_duplicate_faces()
+            cm.repair_non_manifold_edges()
+            if floater_threshold > 0:
+                cm.remove_small_connected_components(floater_threshold)
+            if fill_holes:
+                cm.fill_holes(max_hole_perimeter=fill_holes_perimeter)
+            cm.unify_face_orientations()
+            _log_mesh_stats("after unify_face_orientations", cm)
+    else:
+        with _phase("process_mesh: simplify (post-remesh)"):
+            cm.simplify(target_face_count, verbose=True)
+        _log_mesh_stats(f"after simplify({target_face_count})", cm)
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+
+    if weld_vertices:
+        with _phase(f"process_mesh: weld_vertices(digits={weld_digits})"):
+            wv, wf = cm.read()
+            wm = Trimesh.Trimesh(
+                vertices=wv.cpu().numpy(), faces=wf.cpu().numpy(), process=False,
+            )
+            pre = len(wm.vertices)
+            wm.merge_vertices(digits_vertex=weld_digits)
+            wm.remove_unreferenced_vertices()
+            wm.update_faces(wm.nondegenerate_faces())
+            _dbg(f"  weld: {pre} -> {len(wm.vertices)} verts (digits={weld_digits})")
+            cm.init(
+                torch.tensor(wm.vertices, dtype=torch.float32, device=device),
+                torch.tensor(wm.faces, dtype=torch.int32, device=device),
+            )
+            del wv, wf, wm
+        _log_mesh_stats("after weld", cm)
+
+    with _phase("process_mesh: uv_unwrap (xatlas)"):
+        _log_mesh_stats("pre-uv_unwrap", cm)
+        out_v, out_f, out_uvs, out_vmaps = cm.uv_unwrap(
+            compute_charts_kwargs={
+                "threshold_cone_half_angle_rad": float(np.radians(chart_cone_angle)),
+                "refine_iterations": int(chart_refine_iterations),
+                "global_iterations": int(chart_global_iterations),
+                "smooth_strength": int(chart_smooth_strength),
+            },
+            return_vmaps=True,
+            verbose=True,
+        )
+        cm.compute_vertex_normals()
+        out_normals = cm.read_vertex_normals()[out_vmaps.to(device)].cpu().numpy()
+        # Per-vertex-split count (out_v >= pre-unwrap verts, due to seams).
+        uvs_np = out_uvs.cpu().numpy() if hasattr(out_uvs, "cpu") else np.asarray(out_uvs)
+        _dbg(
+            f"  uv_unwrap out: {out_v.shape[0]} verts (split-at-seams) / "
+            f"{out_f.shape[0]} faces; UV bbox=[{uvs_np.min(axis=0).tolist()}, "
+            f"{uvs_np.max(axis=0).tolist()}]; pre-unwrap verts={int(out_vmaps.max().item()) + 1}"
+        )
+
+    result = Trimesh.Trimesh(
+        vertices=out_v.cpu().numpy(),
+        faces=out_f.cpu().numpy(),
+        vertex_normals=out_normals,
+        process=False,
+    )
+    result.visual = Trimesh.visual.TextureVisuals(uv=out_uvs.cpu().numpy())
+    _dbg(f"process_mesh: OUT {len(result.vertices)} verts / {len(result.faces)} faces (UVs ready)")
+
+    del cm, out_v, out_f, out_uvs, out_vmaps
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+    return result
+
+
+def rasterize_pbr(
+    tri,
+    voxelgrid: dict,
+    texture_size: int = 2048,
+    original_mesh=None,
+    double_sided: bool = False,
+    bake_mode: str = "pbr",
+    debug_dump: bool = False,
+):
+    """drtk UV-space PBR bake. Port of TRELLIS2 Trellis2RasterizePBR.execute().
+    Returns a trimesh.Trimesh with a PBRMaterial(baseColorTexture, metallicRoughnessTexture).
+
+    bake_mode:
+      'pbr'           -- bake baseColor + metallic/roughness/alpha from the voxel grid (production).
+      'xyz_position'  -- diagnostic: paint texels with (x, y, z) position as RGB.
+                         Maps the mesh's AABB into [0, 1]^3 so red=+X, green=+Y, blue=+Z.
+                         If the mesh is in Z-up working frame (post-GenerateMesh rotation),
+                         blue=Z will be the "up" axis on the rendered model.
+      'xyz_normal'    -- diagnostic: paint texels with the interpolated surface normal
+                         as RGB. Normals in [-1, 1] are mapped to [0, 1]. Lets you
+                         visually verify face winding / unify_face_orientations.
+
+    debug_dump: when True, prints extra stats to stderr AND saves diagnostic PNG/OBJ
+                files to ComfyUI/output/ (prefixed pixal3d_debug_<ts>_). Use to
+                inspect chart layout / mesh state when textures look wrong."""
+    import cv2
+    import cumesh as CuMesh
+    from flex_gemm_ap.ops.grid_sample import grid_sample_3d
+    import trimesh as Trimesh
+
+    if not hasattr(tri.visual, "uv") or tri.visual.uv is None:
+        raise ValueError("rasterize_pbr: input trimesh has no UVs. Wire ProcessMesh first.")
+    if "attrs" not in voxelgrid:
+        raise ValueError("rasterize_pbr: voxelgrid dict is missing 'attrs'.")
+
+    device = comfy.model_management.get_torch_device()
+    _dbg(
+        f"rasterize_pbr: {len(tri.vertices)} verts / {len(tri.faces)} faces, "
+        f"texture {texture_size}px, bake_mode={bake_mode}, "
+        f"original_mesh={'yes' if original_mesh is not None else 'no'}, "
+        f"debug_dump={debug_dump}"
+    )
+
+    vertices = torch.tensor(tri.vertices, dtype=torch.float32, device=device)
+    faces = torch.tensor(tri.faces, dtype=torch.int32, device=device)
+    uvs = torch.tensor(tri.visual.uv, dtype=torch.float32, device=device)
+
+    attr_volume = torch.from_numpy(voxelgrid["attrs"]).to(device)
+    coords = torch.from_numpy(voxelgrid["coords"]).to(device)
+    voxel_size_v = float(voxelgrid["voxel_size"])
+    origin = torch.tensor(voxelgrid.get("origin", [-0.5, -0.5, -0.5]), dtype=torch.float32, device=device)
+    voxel_shape = voxelgrid.get("voxel_shape")
+    layout = voxelgrid.get("pbr_attr_layout", {
+        "base_color": slice(0, 3), "metallic": slice(3, 4),
+        "roughness": slice(4, 5), "alpha": slice(5, 6),
+    })
+    aabb_min = origin
+    aabb_max = origin + torch.tensor([1.0, 1.0, 1.0], device=device)
+
+    if voxel_shape is None:
+        grid_size = ((aabb_max - aabb_min) / voxel_size_v).round().int()
+        voxel_shape = tuple(int(x) for x in grid_size.tolist())
+    voxel_size_t = torch.tensor([voxel_size_v] * 3, dtype=torch.float32, device=device)
+
+    with _phase("rasterize_pbr: drtk UV rasterize"):
+        mask, valid_pos, face_ids, bary_masked, rast_face_ids_dbg = _rasterize_uv(
+            vertices, faces, uvs, texture_size, device, debug=debug_dump,
+        )
+
+    # Disk dumps (one-shot). Save mask/face_ids PNGs + OBJ for offline inspection.
+    if debug_dump:
+        with _phase("rasterize_pbr: debug dump (mask/face_ids/obj)"):
+            ts_dbg = int(time.time() * 1000)
+            out_dir_dbg = folder_paths.get_output_directory()
+            prefix = os.path.join(out_dir_dbg, f"pixal3d_debug_{ts_dbg}")
+            try:
+                # Mask PNG: 255 where rasterized, 0 elsewhere.
+                mask_img = (mask.to(torch.uint8) * 255).cpu().numpy()
+                Image.fromarray(mask_img, mode="L").save(f"{prefix}_mask.png")
+                # Face-id PNG: mod 256 to keep it in uint8 range. Tiny isolated
+                # patches in this image indicate tiny UV charts.
+                if rast_face_ids_dbg is not None:
+                    fid = rast_face_ids_dbg.clone()
+                    fid_vis = torch.where(fid >= 0, fid % 256, torch.zeros_like(fid)).to(torch.uint8).cpu().numpy()
+                    Image.fromarray(fid_vis, mode="L").save(f"{prefix}_face_ids.png")
+                    del fid, fid_vis
+                # Mesh OBJ (vertices + faces + UVs). Lets you inspect mesh in Blender.
+                import trimesh as _Trimesh
+                obj_mesh = _Trimesh.Trimesh(
+                    vertices=tri.vertices, faces=tri.faces, process=False,
+                    visual=_Trimesh.visual.TextureVisuals(uv=tri.visual.uv),
+                )
+                obj_mesh.export(f"{prefix}_mesh.obj")
+                del obj_mesh
+                _dbg(f"  wrote {prefix}_{{mask.png, face_ids.png, mesh.obj}}")
+            except Exception as e:
+                _dbg(f"  debug dump failed: {e}")
+            del rast_face_ids_dbg
+
+    if original_mesh is not None:
+        with _phase("rasterize_pbr: BVH-snap texels to original mesh"):
+            orig_v = torch.tensor(original_mesh.vertices, dtype=torch.float32, device=device)
+            orig_f = torch.tensor(original_mesh.faces, dtype=torch.int32, device=device)
+            bvh = CuMesh.cuBVH(orig_v, orig_f)
+            _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
+            orig_tri_v = orig_v[orig_f[face_id.long()]]
+            valid_pos = (orig_tri_v * uvw.unsqueeze(-1)).sum(dim=1)
+            del bvh, orig_v, orig_f, face_id, uvw, orig_tri_v
+
+    comfy.model_management.soft_empty_cache()
+    mask_np = mask.cpu().numpy()
+
+    # --------------------------------------------------------------------
+    # Diagnostic bake modes: paint texels with mesh-frame XYZ position or
+    # interpolated surface normal as RGB. Skip the voxel sample entirely.
+    # --------------------------------------------------------------------
+    if bake_mode in ("xyz_position", "xyz_normal"):
+        with _phase(f"rasterize_pbr: {bake_mode} bake"):
+            if bake_mode == "xyz_position":
+                # Map mesh-frame valid_pos AABB into [0, 1]^3 so red=+X axis,
+                # green=+Y axis, blue=+Z axis on the textured model.
+                v_min = valid_pos.amin(dim=0)
+                v_max = valid_pos.amax(dim=0)
+                span = (v_max - v_min).clamp(min=1e-6)
+                rgb_vals = ((valid_pos - v_min) / span).clamp(0.0, 1.0)
+                log.info(
+                    f"[pixal3d] xyz_position: AABB min={v_min.tolist()}, "
+                    f"max={v_max.tolist()} (mapped to [0,1] RGB)"
+                )
+            else:  # xyz_normal
+                if not hasattr(tri, "vertex_normals") or tri.vertex_normals is None:
+                    raise ValueError(
+                        "rasterize_pbr xyz_normal: input mesh has no vertex_normals. "
+                        "Pixal3DProcessMesh should populate them."
+                    )
+                vnorm = torch.tensor(np.asarray(tri.vertex_normals), dtype=torch.float32, device=device)
+                per_vert_normals = vnorm[faces[face_ids].long()]  # [N_texel, 3, 3]
+                texel_normals = (per_vert_normals * bary_masked.unsqueeze(-1)).sum(dim=1)
+                texel_normals = torch.nn.functional.normalize(texel_normals, dim=-1)
+                rgb_vals = (texel_normals * 0.5 + 0.5).clamp(0.0, 1.0)
+                log.info("[pixal3d] xyz_normal: per-texel normal mapped from [-1,1] to [0,1] RGB")
+
+            rgb_img = torch.zeros(texture_size, texture_size, 3, device=device)
+            rgb_img[mask] = rgb_vals
+            base_color = np.clip(rgb_img.cpu().numpy() * 255, 0, 255).astype(np.uint8)
+            del rgb_img, rgb_vals
+
+        with _phase("rasterize_pbr: cv2.inpaint (UV seam pad, diagnostic)"):
+            mask_inv = (~mask_np).astype(np.uint8)
+            base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+
+        # Build a fully opaque, unlit-ish material so the colors read clean.
+        alpha = np.full((texture_size, texture_size, 1), 255, dtype=np.uint8)
+        material = Trimesh.visual.material.PBRMaterial(
+            baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+            baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+            metallicFactor=0.0,
+            roughnessFactor=1.0,
+            alphaMode="OPAQUE",
+            doubleSided=double_sided,
+        )
+        result = Trimesh.Trimesh(
+            vertices=tri.vertices,
+            faces=tri.faces,
+            vertex_normals=tri.vertex_normals if hasattr(tri, "vertex_normals") else None,
+            process=False,
+            visual=Trimesh.visual.TextureVisuals(uv=tri.visual.uv, material=material),
+        )
+        log.info(f"[pixal3d] rasterize_pbr: {bake_mode} diagnostic texture baked ({texture_size}x{texture_size})")
+        del attr_volume, coords, mask, valid_pos, face_ids, bary_masked
+        gc.collect()
+        comfy.model_management.soft_empty_cache()
+        return result
+
+    # --------------------------------------------------------------------
+    # Production PBR bake.
+    # --------------------------------------------------------------------
+    # Mesh + valid_pos are in Z-up (rotated by Pixal3DGenerateMesh to match
+    # TRELLIS2's verified-working cumesh/drtk regime). The voxelgrid is left
+    # in cascade-native Y-up. Rotate valid_pos Z-up -> Y-up via column swap
+    # so it lines up with the voxelgrid's frame.
+    valid_pos_yup = torch.stack(
+        [valid_pos[:, 0], valid_pos[:, 2], -valid_pos[:, 1]],
+        dim=-1,
+    )
+
+    with _phase("rasterize_pbr: grid_sample_3d (texels)"):
+        attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
+        coords_padded = torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1)
+        attrs[mask] = grid_sample_3d(
+            attr_volume,
+            coords_padded,
+            shape=torch.Size([1, attr_volume.shape[1], *voxel_shape]),
+            grid=((valid_pos_yup - aabb_min) / voxel_size_t).reshape(1, -1, 3),
+            mode="trilinear",
+        )
+
+    del valid_pos, valid_pos_yup, face_ids, bary_masked
+    comfy.model_management.soft_empty_cache()
+
+    bc_slice = layout.get("base_color", slice(0, 3))
+    me_slice = layout.get("metallic", slice(3, 4))
+    ro_slice = layout.get("roughness", slice(4, 5))
+    al_slice = layout.get("alpha", slice(5, 6))
+
+    def _channel(np_slice, channels):
+        out = np.clip(attrs[..., np_slice].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        # cv2.inpaint wants HxW or HxWxC contiguous uint8; for 1-channel keep [..., None].
+        return out if out.ndim == 3 and out.shape[-1] == channels else out[..., None]
+
+    base_color = _channel(bc_slice, 3)
+    metallic = _channel(me_slice, 1)
+    roughness = _channel(ro_slice, 1)
+    alpha = _channel(al_slice, 1)
+
+    del attrs, mask, attr_volume, coords
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    with _phase("rasterize_pbr: cv2.inpaint (UV seam pad)"):
+        mask_inv = (~mask_np).astype(np.uint8)
+        base_color = cv2.inpaint(base_color, mask_inv, 3, cv2.INPAINT_TELEA)
+        metallic = cv2.inpaint(metallic, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+        alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
+
+    material = Trimesh.visual.material.PBRMaterial(
+        baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+        baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
+        metallicRoughnessTexture=Image.fromarray(np.concatenate([
+            np.zeros_like(metallic), roughness, metallic,
+        ], axis=-1)),
+        metallicFactor=1.0,
+        roughnessFactor=1.0,
+        alphaMode="OPAQUE",
+        doubleSided=double_sided,
+    )
+
+    result = Trimesh.Trimesh(
+        vertices=tri.vertices,
+        faces=tri.faces,
+        vertex_normals=tri.vertex_normals if hasattr(tri, "vertex_normals") else None,
+        process=False,
+        visual=Trimesh.visual.TextureVisuals(uv=tri.visual.uv, material=material),
+    )
+    log.info(f"[pixal3d] rasterize_pbr: {texture_size}x{texture_size} PBR textures baked")
+    return result
+
+
+# ----------------------------------------------------------------------------
+# Coordinate frame rotations.
+#
+# Pixal3D's cascade emits MeshWithVoxel.vertices in Y-up natively (the model
+# is camera-conditioned via MoGe-2 / DinoV3, training data is Y-up). TRELLIS2's
+# cascade is Z-up. The cumesh/drtk UV-bake regime in TRELLIS2 is visually
+# verified working on Z-up data; on Pixal3D's Y-up mesh the same code produces
+# garbled, seam-bleed textures. Fix: route the split-node UV-bake path through
+# Z-up internally (rotate at GenerateMesh, rotate `valid_pos` back for the
+# voxel sample, rotate back to Y-up at ExportGLB). Monolithic vertex-color
+# path stays Y-up throughout.
+# ----------------------------------------------------------------------------
+
+_YUP_TO_ZUP_ROT = np.array(
+    # (x, y, z) -> (x, -z, y). Inverse of _ZUP_TO_YUP_ROT.
+    [[1, 0,  0, 0],
+     [0, 0, -1, 0],
+     [0, 1,  0, 0],
+     [0, 0,  0, 1]],
+    dtype=np.float64,
+)
+
+_ZUP_TO_YUP_ROT = np.array(
+    # (x, y, z) -> (x, z, -y). Matches TRELLIS2 nodes_unwrap.py:1325 verbatim
+    # assignment: vertices[:, 1], vertices[:, 2] = vertices[:, 2], -vertices[:, 1].
+    [[1,  0, 0, 0],
+     [0,  0, 1, 0],
+     [0, -1, 0, 0],
+     [0,  0, 0, 1]],
+    dtype=np.float64,
+)
+
+
+def export_glb(tri, filename_prefix: str = "pixal3d") -> str:
+    """Write the trimesh to ComfyUI's output dir as a GLB and return the absolute path.
+
+    No coordinate rotation is applied. Used by the monolithic vertex-color path
+    where the mesh stays Y-up throughout (Pixal3D's cascade-native frame).
+    For the split-node UV-bake path use export_glb_yup, which un-rotates the
+    Z-up working frame back to Y-up for the final GLB."""
+    out_dir = folder_paths.get_output_directory()
+    ts = int(time.time() * 1000)
+    out_path = os.path.join(out_dir, f"{filename_prefix}_{ts}.glb")
+    tri.export(out_path)
+    log.info(f"[pixal3d] Saved GLB to {out_path}")
+    return out_path
+
+
+def export_glb_yup(tri, filename_prefix: str = "pixal3d") -> str:
+    """Apply Z-up -> Y-up rotation + UV V flip, then write to ComfyUI's output dir.
+
+    Mirrors TRELLIS2 Trellis2ExportTrimesh.execute() lines 1397-1411 EXACTLY:
+      1. Rotate vertices  (x, y, z) -> (x, z, -y)   (Z-up to Y-up).
+      2. Rotate normals   (x, y, z) -> (x, z, -y)   (same swap; we apply it
+         manually instead of via trimesh.apply_transform because the latter
+         invalidates user-supplied vertex_normals and forces a recompute).
+      3. Flip UV V        v -> 1 - v                (CRITICAL: glTF's V
+         convention is inverted relative to cumesh/drtk's UV output.
+         Without this flip the rasterized texture appears V-mirrored per
+         chart on the rendered model, which combined with chart packing
+         looks garbled / discontinuous).
+
+    Deepcopy first so we don't mutate the caller's trimesh (matches TRELLIS2)."""
+    import copy as _copy
+    export_mesh = _copy.deepcopy(tri)
+
+    verts = export_mesh.vertices.copy()
+    verts[:, 1], verts[:, 2] = verts[:, 2].copy(), -verts[:, 1].copy()
+    export_mesh.vertices = verts
+
+    if (hasattr(export_mesh, "vertex_normals")
+            and export_mesh.vertex_normals is not None
+            and len(export_mesh.vertex_normals) > 0):
+        normals = export_mesh.vertex_normals.copy()
+        normals[:, 1], normals[:, 2] = normals[:, 2].copy(), -normals[:, 1].copy()
+        export_mesh.vertex_normals = normals
+
+    if hasattr(export_mesh.visual, "uv") and export_mesh.visual.uv is not None:
+        uvs = export_mesh.visual.uv.copy()
+        uvs[:, 1] = 1 - uvs[:, 1]
+        export_mesh.visual.uv = uvs
+
+    return export_glb(export_mesh, filename_prefix=filename_prefix)
+
+
+# ----------------------------------------------------------------------------
+# Convenience: cascade + mesh + voxelgrid, as a single helper exposed to nodes.
+# ----------------------------------------------------------------------------
+
+
+def generate_mesh_and_voxelgrid(
+    image: torch.Tensor,
+    camera_params: dict,
+    seed: int = 42,
+    pipeline_type: str = "1024_cascade",
+    attn_backend: str = "auto",
+    max_num_tokens: int = 49152,
+    ss_steps: int = 12, ss_guidance: float = 7.5, ss_rescale: float = 0.7, ss_rescale_t: float = 5.0,
+    shape_steps: int = 12, shape_guidance: float = 7.5, shape_rescale: float = 0.5, shape_rescale_t: float = 3.0,
+    tex_steps: int = 12, tex_guidance: float = 1.0, tex_rescale: float = 0.0, tex_rescale_t: float = 3.0,
+):
+    """Run the cascade and split the result into IPC-safe (TRIMESH, PIXAL3D_VOXELGRID).
+    The trimesh is the raw DC mesh in pixal3d internal coords ([-0.5, 0.5]^3, Z-up)."""
+    pipeline, mw, _res = _run_cascade(
+        image, camera_params, seed, pipeline_type, attn_backend, max_num_tokens,
+        ss_steps, ss_guidance, ss_rescale, ss_rescale_t,
+        shape_steps, shape_guidance, shape_rescale, shape_rescale_t,
+        tex_steps, tex_guidance, tex_rescale, tex_rescale_t,
+    )
+    tri = _trimesh_from_meshwithvoxel(mw)
+    voxelgrid = _meshwithvoxel_to_dict(mw, pipeline)
+    del mw
+    gc.collect()
+    torch.cuda.empty_cache()
+    return tri, voxelgrid
+
+
+# ----------------------------------------------------------------------------
+# Monolithic vertex-color path. Backwards-compatible Pixal3DGenerateGLB body.
+# ----------------------------------------------------------------------------
+
 
 def generate_glb(
     image: torch.Tensor,
@@ -727,150 +1543,31 @@ def generate_glb(
     pipeline_type: str = "1024_cascade",
     attn_backend: str = "auto",
     max_num_tokens: int = 49152,
-    # Sampler knobs (defaults match inference.py)
-    ss_steps: int = 12,
-    ss_guidance: float = 7.5,
-    ss_rescale: float = 0.7,
-    ss_rescale_t: float = 5.0,
-    shape_steps: int = 12,
-    shape_guidance: float = 7.5,
-    shape_rescale: float = 0.5,
-    shape_rescale_t: float = 3.0,
-    tex_steps: int = 12,
-    tex_guidance: float = 1.0,
-    tex_rescale: float = 0.0,
-    tex_rescale_t: float = 3.0,
-    # GLB extraction
+    ss_steps: int = 12, ss_guidance: float = 7.5, ss_rescale: float = 0.7, ss_rescale_t: float = 5.0,
+    shape_steps: int = 12, shape_guidance: float = 7.5, shape_rescale: float = 0.5, shape_rescale_t: float = 3.0,
+    tex_steps: int = 12, tex_guidance: float = 1.0, tex_rescale: float = 0.0, tex_rescale_t: float = 3.0,
     decimation_target: int = 200000,
     texture_size: int = 2048,
     pre_simplify: bool = True,
     pre_simplify_target_faces: int = 2_000_000,
     force_opaque: bool = True,
+    double_sided: bool = False,
+    remove_inner_faces: bool = False,
     filename_prefix: str = "pixal3d",
 ) -> str:
-    """Run cascade + extract GLB. Returns absolute path to the saved GLB."""
-    pipeline = init_pipeline(attn_backend=attn_backend)
-
-    pil = comfy_image_to_pil(image)
-
-    torch.manual_seed(seed)
-    log.info(f"[pixal3d] Running cascade ({pipeline_type}, seed={seed})")
-    mesh_list, (shape_slat, tex_slat, res) = pipeline.run(
-        pil,
-        camera_params=camera_params,
-        seed=seed,
-        sparse_structure_sampler_params={
-            "steps": ss_steps,
-            "guidance_strength": ss_guidance,
-            "guidance_rescale": ss_rescale,
-            "rescale_t": ss_rescale_t,
-        },
-        shape_slat_sampler_params={
-            "steps": shape_steps,
-            "guidance_strength": shape_guidance,
-            "guidance_rescale": shape_rescale,
-            "rescale_t": shape_rescale_t,
-        },
-        tex_slat_sampler_params={
-            "steps": tex_steps,
-            "guidance_strength": tex_guidance,
-            "guidance_rescale": tex_rescale,
-            "rescale_t": tex_rescale_t,
-        },
-        preprocess_image=False,
-        return_latent=True,
-        pipeline_type=pipeline_type,
-        max_num_tokens=max_num_tokens,
+    """Cascade -> light cleanup -> vertex-color bake -> GLB. The monolithic convenience
+    path: no UV unwrap, no texture map, fast. For UV-baked output use the split node
+    chain (GenerateMesh -> ProcessMesh -> RasterizePBR -> ExportGLB)."""
+    tri, voxelgrid = generate_mesh_and_voxelgrid(
+        image, camera_params, seed, pipeline_type, attn_backend, max_num_tokens,
+        ss_steps, ss_guidance, ss_rescale, ss_rescale_t,
+        shape_steps, shape_guidance, shape_rescale, shape_rescale_t,
+        tex_steps, tex_guidance, tex_rescale, tex_rescale_t,
     )
-
-    mesh = mesh_list[0]
-    log.info(f"[pixal3d] Mesh extracted at resolution {res}; baking vertex colors + GLB")
-
-    # MVP export path: query per-vertex PBR from the voxel grid, write a vertex-colored
-    # GLB. Upstream o_voxel.postprocess.to_glb (which does UV unwrap + texture baking) is
-    # not available in the o_voxel_vb_ap fork (its nvdiffrast-dependent paths were
-    # stripped). We trade texture-map fidelity for an MVP that uses only the fork's API.
-    # A future iteration can do the drtk-based UV bake — see plan file Phase 2.
-    import trimesh
-
-    verts = mesh.vertices.detach()
-    faces = mesh.faces.detach()
-    with torch.no_grad():
-        vattrs = mesh.query_vertex_attrs()  # [N, C], C covers base_color/metallic/roughness/alpha
-    base_color_slice = pipeline.pbr_attr_layout.get("base_color", slice(0, 3))
-    rgb = vattrs[:, base_color_slice].clamp(0.0, 1.0).cpu().numpy()
-    rgb = (rgb * 255).astype(np.uint8)
-    alpha_slice = pipeline.pbr_attr_layout.get("alpha", None)
-
-    material = None
-    if force_opaque:
-        # 3-channel COLOR_0 (VEC3). No alpha attribute in the glTF at all, so
-        # three.js / model-viewer / etc. can't auto-switch to BLEND mode based
-        # on a "present" alpha channel. Cleanest opaque output.
-        vertex_colors = rgb
-    elif alpha_slice is not None:
-        # 4-channel COLOR_0 (VEC4) + explicit PBRMaterial(alphaMode=BLEND,
-        # doubleSided=True). three.js GLTFLoader honors the material's
-        # alphaMode and does proper depth-sorted translucency. doubleSided
-        # so thin shells (glass, foliage) render from both sides.
-        a = vattrs[:, alpha_slice].clamp(0.0, 1.0).cpu().numpy()
-        a = (a * 255).astype(np.uint8)
-        if a.ndim == 2 and a.shape[1] == 1:
-            a = a[:, 0]
-        vertex_colors = np.concatenate([rgb, a[:, None]], axis=1)
-        # Note: deliberately NOT passing baseColorFactor -- trimesh treats it as
-        # uint8 in the 0-255 range and divides by 255, so [1.0,1.0,1.0,1.0]
-        # becomes [0.0039,...]. Omitting it falls back to glTF's default
-        # [1,1,1,1] which is what we want (vertex_colors carry the actual color).
-        material = trimesh.visual.material.PBRMaterial(
-            name="pixal3d_translucent",
-            alphaMode="BLEND",
-            doubleSided=True,
-            metallicFactor=0.0,
-            roughnessFactor=1.0,
-        )
-    else:
-        vertex_colors = rgb  # pipeline has no alpha layout key -- treat as opaque
-
-    tri = trimesh.Trimesh(
-        vertices=verts.cpu().numpy(),
-        faces=faces.cpu().numpy(),
-        vertex_colors=vertex_colors,
-        process=False,
-    )
-
-    # Fix mesh winding -- the shape decoder produces inconsistent/inverted
-    # winding (we measured mixed inward/outward face normals on prior runs).
-    # Upstream pixal3d cleaned this up inside o_voxel.postprocess.to_glb(remesh=True),
-    # which our drtk fork stripped. trimesh.repair.fix_winding walks face
-    # adjacency to align winding, then flips globally if the resulting volume
-    # has negative sign. Cheap equivalent of upstream's remesh-driven fix.
-    with _phase("fix_winding"):
-        trimesh.repair.fix_winding(tri)
-
-    if material is not None:
-        tri.visual.material = material
-
-    # GLTF rotation (Y-up) — verbatim from inference.py:181
-    rot = np.array(
-        [
-            [-1, 0, 0, 0],
-            [0, 0, -1, 0],
-            [0, -1, 0, 0],
-            [0, 0, 0, 1],
-        ],
-        dtype=np.float64,
-    )
-    tri.apply_transform(rot)
-
-    out_dir = folder_paths.get_output_directory()
-    ts = int(time.time() * 1000)
-    out_path = os.path.join(out_dir, f"{filename_prefix}_{ts}.glb")
-    tri.export(out_path)
-    log.info(f"[pixal3d] Saved GLB to {out_path}")
-
-    # Drop large intermediates before returning across IPC.
-    del mesh, mesh_list, shape_slat, tex_slat, tri, vattrs
+    cleaned = _light_clean(tri, remove_inner_faces=remove_inner_faces)
+    colored = _bake_vertex_colors(cleaned, voxelgrid, force_opaque=force_opaque, double_sided=double_sided)
+    out_path = export_glb(colored, filename_prefix=filename_prefix)
+    del tri, cleaned, colored, voxelgrid
     gc.collect()
     torch.cuda.empty_cache()
 
