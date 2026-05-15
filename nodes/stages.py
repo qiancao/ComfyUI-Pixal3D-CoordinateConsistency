@@ -108,7 +108,6 @@ def _comfy_tqdm():
 # ============================================================================
 
 PIXAL3D_REPO = "TencentARC/Pixal3D"
-MOGE_REPO = "Ruicheng/moge-2-vitl"
 DINOV3_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
 NAF_REPO = "https://github.com/valeoai/NAF.git"
 NAF_CHECKPOINT_URL = "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth"
@@ -180,7 +179,6 @@ def _local_pixal3d_dir() -> Path:
 # ============================================================================
 
 _pipeline = None
-_moge_model = None
 # id(model_instance) -> ModelPatcher. Used by _wrap_with_comfy_patcher to route
 # pixal3d's per-stage .to(device) / .cpu() calls through ComfyUI's memory
 # manager (load_models_gpu auto-offloads competing models in the workflow).
@@ -551,24 +549,6 @@ def _build_cond(key: str):
 
 
 # ============================================================================
-# MoGe
-# ============================================================================
-
-def init_moge():
-    global _moge_model
-    if _moge_model is not None:
-        return _moge_model
-
-    _check_gpu_or_raise()
-    with _phase("init_moge: MoGeModel.from_pretrained"):
-        from moge.model.v2 import MoGeModel
-        moge = MoGeModel.from_pretrained(MOGE_REPO).to(_mm().get_torch_device())
-        moge.eval()
-    _moge_model = moge
-    return moge
-
-
-# ============================================================================
 # Image utils — ComfyUI IMAGE <-> PIL
 # ============================================================================
 
@@ -694,27 +674,18 @@ def _distance_from_fov(camera_angle_x, grid_point, target_point, mesh_scale, ima
     return float(distance_x)
 
 
-def estimate_camera(
-    image: torch.Tensor,
+def pack_camera_from_fov(
+    fov_x_deg: float,
     mesh_scale: float = 1.0,
     extend_pixel: int = 0,
     image_resolution: int = 512,
 ) -> dict:
-    moge = init_moge()
+    """Build a PIXAL3D_CAMERA dict from an externally-measured FOV.
 
-    pil = comfy_image_to_pil(image)
-    width, height = pil.size
-    arr = np.asarray(pil, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).to(_mm().get_torch_device())
-
-    with torch.no_grad():
-        out = moge.infer(tensor)
-
-    intrinsics = out["intrinsics"].squeeze().cpu().numpy()
-    fx_normalized = float(intrinsics[0, 0])
-    fx = fx_normalized * width
-    camera_angle_x = 2.0 * math.atan(width / (2.0 * fx))
-
+    Pairs with the ComfyUI-MoGe2 pack's `MoGe2Inference` node, which emits
+    `fov_x` in degrees. We convert to radians and run the same
+    _distance_from_fov math the legacy estimate_camera() used."""
+    camera_angle_x = math.radians(float(fov_x_deg))
     grid_point = torch.tensor([-1.0, 0.0, 0.0])
     distance = _distance_from_fov(
         camera_angle_x,
