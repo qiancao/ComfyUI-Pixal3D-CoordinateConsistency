@@ -1,3 +1,6 @@
+> [!WARNING]
+> Warning, uses experimental package `comfy-env` to attempt a one click isolated install. Will download and use pixi package manager.
+
 # ComfyUI-Pixal3D
 
 ComfyUI nodes for **Pixal3D** (SIGGRAPH 2026, TencentARC) — pixel-aligned image-to-3D generation. Single image in, textured GLB out.
