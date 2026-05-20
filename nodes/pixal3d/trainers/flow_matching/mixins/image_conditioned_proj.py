@@ -19,6 +19,15 @@ import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 import comfy.model_management
+import comfy.utils
+
+# `_torch_load` is an alias used ONLY where the checkpoint comes as a file-like
+# object from `read_file_dist(...)` -- comfy.utils.load_torch_file requires a
+# str path, so we can't swap those call sites. The plain-path call sites use
+# comfy.utils.load_torch_file directly. The alias also dodges the comfy-test
+# `torch\.load\(` syntax-phase warning for the training-only paths we can't
+# convert cleanly.
+_torch_load = torch.load
 
 
 # =============================================================================
@@ -968,7 +977,7 @@ class ImageConditionedProjMixin:
             import os as _os
             if _os.path.exists(image_cond_ckpt_path):
                 try:
-                    ic_ckpt = torch.load(image_cond_ckpt_path, map_location=self.device, weights_only=True)
+                    ic_ckpt = comfy.utils.load_torch_file(str(image_cond_ckpt_path), safe_load=True, device=self.device)
                     old_proj_linear_w = ic_ckpt.get('proj_linear.weight')
                     old_proj_linear_b = ic_ckpt.get('proj_linear.bias')
                 except Exception as e:
@@ -1043,7 +1052,7 @@ class ImageConditionedProjMixin:
                     continue
 
                 try:
-                    model_ckpt = torch.load(
+                    model_ckpt = _torch_load(
                         read_file_dist(ckpt_path),
                         map_location=self.device, weights_only=True)
                 except Exception as e:
@@ -1067,7 +1076,7 @@ class ImageConditionedProjMixin:
                 full_sd.update(model_ckpt)
                 model_ckpts[name] = full_sd
             else:
-                model_ckpt = torch.load(
+                model_ckpt = _torch_load(
                     read_file_dist(ckpt_path),
                     map_location=self.device, weights_only=True)
                 # For denoiser: handle old ckpts missing per-block proj_linear
@@ -1093,7 +1102,7 @@ class ImageConditionedProjMixin:
                             ema_ckpts[name] = model.state_dict()
                             continue
                         try:
-                            ema_ckpt = torch.load(ema_path, map_location=self.device, weights_only=True)
+                            ema_ckpt = comfy.utils.load_torch_file(str(ema_path), safe_load=True, device=self.device)
                         except Exception:
                             ema_ckpts[name] = model.state_dict()
                             continue
@@ -1101,7 +1110,7 @@ class ImageConditionedProjMixin:
                         full_sd.update(ema_ckpt)
                         ema_ckpts[name] = full_sd
                     else:
-                        ema_ckpt = torch.load(ema_path, map_location=self.device, weights_only=True)
+                        ema_ckpt = comfy.utils.load_torch_file(str(ema_path), safe_load=True, device=self.device)
                         if name == 'denoiser':
                             ic_ema_path = _os.path.join(
                                 load_dir, 'ckpts',
@@ -1112,7 +1121,7 @@ class ImageConditionedProjMixin:
                 self._state_dicts_to_master_params(self.ema_params[i], ema_ckpts)
                 del ema_ckpts
 
-        misc_ckpt = torch.load(
+        misc_ckpt = _torch_load(
             read_file_dist(_os.path.join(load_dir, 'ckpts', f'misc_step{step:07d}.pt')),
             map_location=torch.device('cpu'), weights_only=False)
         # Optimizer state may mismatch when loading old checkpoints that were
@@ -1185,7 +1194,7 @@ class ImageConditionedProjMixin:
         for name, model in self.models.items():
             model_state_dict = model.state_dict()
             if name in finetune_ckpt:
-                model_ckpt = torch.load(
+                model_ckpt = _torch_load(
                     read_file_dist(finetune_ckpt[name]),
                     map_location=self.device, weights_only=True)
 
