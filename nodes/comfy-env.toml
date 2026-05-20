@@ -33,12 +33,6 @@ imageio-ffmpeg = "*"
 numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
-# Camera FOV estimation is now handled by the separate ComfyUI-MoGe2 pack
-# (https://github.com/PozzettiAndrea/ComfyUI-MoGe2). Wire MoGe2Inference.fov_x ->
-# Pixal3DCameraFromFOV.fov_x_deg in the workflow. No moge / utils3d pin needed here.
-# natten: SHI-Labs publishes prebuilt wheels per (torch, cuda, python) combo.
-# This pin matches the bootstrap torch2.8+cu128/py3.10. Update the suffix when bumping torch/CUDA.
-natten = { url = "https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.1/natten-0.21.1+torch280cu128-cp310-cp310-linux_x86_64.whl" }
 
 [env_vars]
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
