@@ -109,7 +109,10 @@ def _comfy_tqdm():
 
 PIXAL3D_REPO = "TencentARC/Pixal3D"
 DINOV3_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
-NAF_REPO = "https://github.com/valeoai/NAF.git"
+# NAF source is vendored under nodes/naf_pkg/ (see VENDORED.md). The .pth
+# checkpoint stays a runtime download -- it's ~100 MB and doesn't belong in
+# the repo. urllib is portable across Linux/Windows/Mac so no subprocess.
+NAF_VENDOR_DIR = Path(__file__).parent / "naf_pkg"
 NAF_CHECKPOINT_URL = "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth"
 
 IMAGE_COND_CONFIGS = {
@@ -230,31 +233,24 @@ def _download_pixal3d_weights():
 
 
 def _download_naf() -> Tuple[Path, Path]:
-    """Ensure NAF source + checkpoint exist in ComfyUI/models/naf/.
+    """Return (vendored_naf_source_dir, naf_checkpoint_path).
 
-    Replaces torch.hub.load("valeoai/NAF", ...) which (a) hits api.github.com
-    on every cold boot, (b) caches under ~/.cache/torch/hub (off the
-    ComfyUI/models/ convention), (c) used to break under bad GITHUB_TOKEN env.
-
-    Returns (source_dir, ckpt_path). source_dir is added to sys.path so the
-    `NAF` class becomes importable as `src.model.naf.NAF`.
+    NAF source is vendored under nodes/naf_pkg/ (see VENDORED.md for the
+    upstream commit hash). This used to git-clone valeoai/NAF at first use,
+    which broke on Windows test containers without git.exe on PATH
+    (WinError 2). Now the source ships with the pack -- only the ~100 MB
+    .pth checkpoint downloads at runtime via urllib (portable, no system
+    binaries).
     """
     naf_dir = Path(folder_paths.models_dir) / "naf"
-    src_dir = naf_dir / "source"
-    ckpt = naf_dir / "naf_release.pth"
     naf_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = naf_dir / "naf_release.pth"
 
-    if not (src_dir / "hubconf.py").exists():
-        import subprocess
-        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
-        subprocess.check_call(
-            ["git", "clone", "--depth", "1", NAF_REPO, str(src_dir)],
-            env=env,
-        )
     if not ckpt.exists():
         import urllib.request
+        log.info(f"  downloading NAF checkpoint to {ckpt}")
         urllib.request.urlretrieve(NAF_CHECKPOINT_URL, str(ckpt))
-    return src_dir, ckpt
+    return NAF_VENDOR_DIR, ckpt
 
 
 def _patch_naf_to_local_model():
