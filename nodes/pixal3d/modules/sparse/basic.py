@@ -2,7 +2,10 @@ from typing import *
 from fractions import Fraction
 import torch
 from . import config
-import comfy.model_management
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
 
 
 __all__ = [
@@ -148,7 +151,7 @@ class VarLenTensor:
         return self.replace(new_feats)
     
     def cuda(self) -> 'VarLenTensor':
-        new_feats = self.feats.to(comfy.model_management.get_torch_device())
+        new_feats = self.feats.to(_mm().get_torch_device())
         return self.replace(new_feats)
 
     def half(self) -> 'VarLenTensor':
@@ -612,8 +615,8 @@ class SparseTensor(VarLenTensor):
         return self.replace(new_feats, new_coords)
     
     def cuda(self) -> 'SparseTensor':
-        new_feats = self.feats.to(comfy.model_management.get_torch_device())
-        new_coords = self.coords.to(comfy.model_management.get_torch_device())
+        new_feats = self.feats.to(_mm().get_torch_device())
+        new_coords = self.coords.to(_mm().get_torch_device())
         return self.replace(new_feats, new_coords)
 
     def half(self) -> 'SparseTensor':

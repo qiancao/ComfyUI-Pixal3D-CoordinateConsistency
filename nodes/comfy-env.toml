@@ -1,7 +1,7 @@
 python = "3.10"
 
 [cuda]
-packages = ["flex_gemm_ap", "cumesh_vb", "o_voxel_vb_ap", "flash-attn", "sageattention", "drtk"]
+packages = ["flex_gemm_ap", "cumesh_vb", "o_voxel_vb_ap", "flash-attn", "sageattention", "drtk", "natten"]
 
 [dependencies]
 av = "*"
@@ -33,13 +33,6 @@ imageio-ffmpeg = "*"
 numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
-moge = { git = "https://github.com/microsoft/MoGe.git" }
-# Note: utils3d is NOT pinned here — MoGe brings in its own version transitively,
-# and the inference path (pixal3d.pipelines.Pixal3DImageTo3DPipeline + DinoV3ProjFeatureExtractor)
-# never imports utils3d directly. Pinning ours separately conflicts with MoGe's URL.
-# natten: SHI-Labs publishes prebuilt wheels per (torch, cuda, python) combo.
-# This pin matches the bootstrap torch2.8+cu128/py3.10. Update the suffix when bumping torch/CUDA.
-natten = { url = "https://github.com/SHI-Labs/NATTEN/releases/download/v0.21.1/natten-0.21.1+torch280cu128-cp310-cp310-linux_x86_64.whl" }
 
 [env_vars]
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"

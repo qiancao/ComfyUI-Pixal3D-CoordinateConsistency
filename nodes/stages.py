@@ -24,11 +24,24 @@ import numpy as np
 import torch
 from PIL import Image
 
-import comfy.model_management
-import comfy.utils
 import folder_paths
 
 log = logging.getLogger("pixal3d")
+
+
+def _mm():
+    """Lazy accessor for _mm(). Deferred so importing this
+    module doesn't trigger ComfyUI's module-level CUDA detection
+    (comfy/model_management.py calls torch.cuda.current_device() at import
+    time, which AssertionError-s on CPU-only torch builds)."""
+    import comfy.model_management as _m
+    return _m
+
+
+def _cu():
+    """Lazy accessor for _cu(). Deferred for symmetry / hygiene."""
+    import comfy.utils as _u
+    return _u
 
 
 # ============================================================================
@@ -78,7 +91,7 @@ def _comfy_tqdm():
             if self.total and self.total > 0 and holder["pbar"] is None:
                 holder["total"] = self.total
                 holder["done"] = 0
-                holder["pbar"] = comfy.utils.ProgressBar(self.total)
+                holder["pbar"] = _cu().ProgressBar(self.total)
 
         def update(self, n=1):
             ret = super().update(n)
@@ -95,9 +108,11 @@ def _comfy_tqdm():
 # ============================================================================
 
 PIXAL3D_REPO = "TencentARC/Pixal3D"
-MOGE_REPO = "Ruicheng/moge-2-vitl"
 DINOV3_REPO = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
-NAF_REPO = "https://github.com/valeoai/NAF.git"
+# NAF source is vendored under nodes/naf_pkg/ (see VENDORED.md). The .pth
+# checkpoint stays a runtime download -- it's ~100 MB and doesn't belong in
+# the repo. urllib is portable across Linux/Windows/Mac so no subprocess.
+NAF_VENDOR_DIR = Path(__file__).parent / "naf_pkg"
 NAF_CHECKPOINT_URL = "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth"
 
 IMAGE_COND_CONFIGS = {
@@ -167,7 +182,6 @@ def _local_pixal3d_dir() -> Path:
 # ============================================================================
 
 _pipeline = None
-_moge_model = None
 # id(model_instance) -> ModelPatcher. Used by _wrap_with_comfy_patcher to route
 # pixal3d's per-stage .to(device) / .cpu() calls through ComfyUI's memory
 # manager (load_models_gpu auto-offloads competing models in the workflow).
@@ -219,31 +233,24 @@ def _download_pixal3d_weights():
 
 
 def _download_naf() -> Tuple[Path, Path]:
-    """Ensure NAF source + checkpoint exist in ComfyUI/models/naf/.
+    """Return (vendored_naf_source_dir, naf_checkpoint_path).
 
-    Replaces torch.hub.load("valeoai/NAF", ...) which (a) hits api.github.com
-    on every cold boot, (b) caches under ~/.cache/torch/hub (off the
-    ComfyUI/models/ convention), (c) used to break under bad GITHUB_TOKEN env.
-
-    Returns (source_dir, ckpt_path). source_dir is added to sys.path so the
-    `NAF` class becomes importable as `src.model.naf.NAF`.
+    NAF source is vendored under nodes/naf_pkg/ (see VENDORED.md for the
+    upstream commit hash). This used to git-clone valeoai/NAF at first use,
+    which broke on Windows test containers without git.exe on PATH
+    (WinError 2). Now the source ships with the pack -- only the ~100 MB
+    .pth checkpoint downloads at runtime via urllib (portable, no system
+    binaries).
     """
     naf_dir = Path(folder_paths.models_dir) / "naf"
-    src_dir = naf_dir / "source"
-    ckpt = naf_dir / "naf_release.pth"
     naf_dir.mkdir(parents=True, exist_ok=True)
+    ckpt = naf_dir / "naf_release.pth"
 
-    if not (src_dir / "hubconf.py").exists():
-        import subprocess
-        env = {k: v for k, v in os.environ.items() if k != "GITHUB_TOKEN"}
-        subprocess.check_call(
-            ["git", "clone", "--depth", "1", NAF_REPO, str(src_dir)],
-            env=env,
-        )
     if not ckpt.exists():
         import urllib.request
+        log.info(f"  downloading NAF checkpoint to {ckpt}")
         urllib.request.urlretrieve(NAF_CHECKPOINT_URL, str(ckpt))
-    return src_dir, ckpt
+    return NAF_VENDOR_DIR, ckpt
 
 
 def _patch_naf_to_local_model():
@@ -273,7 +280,7 @@ def _patch_naf_to_local_model():
             with _phase("NAF model build + ckpt load"):
                 from src.model.naf import NAF  # noqa: F401  (resolved via sys.path)
                 m = NAF()
-                m.load_state_dict(comfy.utils.load_torch_file(str(ckpt), safe_load=True))
+                m.load_state_dict(_cu().load_torch_file(str(ckpt), safe_load=True))
                 m.eval()
                 m.requires_grad_(False)
                 _naf = m
@@ -370,8 +377,8 @@ def _wrap_with_comfy_patcher(model):
     if id(model) in _model_patchers:
         return _model_patchers[id(model)]
 
-    load_device = comfy.model_management.get_torch_device()
-    offload_device = comfy.model_management.unet_offload_device()
+    load_device = _mm().get_torch_device()
+    offload_device = _mm().unet_offload_device()
 
     # Build the patcher; the model stays on whatever device it's currently on
     # (typically CPU after from_pretrained). Pixal3D's model classes now accept
@@ -405,7 +412,7 @@ def _wrap_with_comfy_patcher(model):
             _reentry.inside = True
             try:
                 # Inform ComfyUI's memory manager (auto-offloads competing models).
-                comfy.model_management.load_models_gpu([patcher])
+                _mm().load_models_gpu([patcher])
                 # ComfyUI's ModelPatcher.load doesn't always physically relocate
                 # the wrapped module -- it manages cast/lowvram patches for its
                 # own forward path. Pixal3D accesses .weight directly, so we
@@ -424,7 +431,7 @@ def _wrap_with_comfy_patcher(model):
             patcher.unpatch_model(device_to=offload_device)
             # Same reason as above: physically move the module's tensors back.
             _orig_cpu()
-            comfy.model_management.soft_empty_cache()
+            _mm().soft_empty_cache()
         finally:
             _reentry.inside = False
         return model
@@ -503,7 +510,7 @@ def init_pipeline(attn_backend: str = "auto") -> "object":
         # stays 'cpu' from from_pretrained, get_proj_cond_ss reads it, and the
         # subsequent `image_cond_model.to(self.device)` is .to('cpu') -- a no-op.
         # The conv2d then fails with cuda-input vs cpu-weight.
-        pipeline.to(comfy.model_management.get_torch_device())
+        pipeline.to(_mm().get_torch_device())
         with _phase("ModelPatcher wrap: 13 models"):
             _wrap_pipeline_models_with_patchers(pipeline)
 
@@ -535,24 +542,6 @@ def _build_cond(key: str):
     if not hasattr(inner, "layer") and hasattr(inner, "model") and hasattr(inner.model, "layer"):
         inner.layer = inner.model.layer
     return model
-
-
-# ============================================================================
-# MoGe
-# ============================================================================
-
-def init_moge():
-    global _moge_model
-    if _moge_model is not None:
-        return _moge_model
-
-    _check_gpu_or_raise()
-    with _phase("init_moge: MoGeModel.from_pretrained"):
-        from moge.model.v2 import MoGeModel
-        moge = MoGeModel.from_pretrained(MOGE_REPO).to(comfy.model_management.get_torch_device())
-        moge.eval()
-    _moge_model = moge
-    return moge
 
 
 # ============================================================================
@@ -681,27 +670,18 @@ def _distance_from_fov(camera_angle_x, grid_point, target_point, mesh_scale, ima
     return float(distance_x)
 
 
-def estimate_camera(
-    image: torch.Tensor,
+def pack_camera_from_fov(
+    fov_x_deg: float,
     mesh_scale: float = 1.0,
     extend_pixel: int = 0,
     image_resolution: int = 512,
 ) -> dict:
-    moge = init_moge()
+    """Build a PIXAL3D_CAMERA dict from an externally-measured FOV.
 
-    pil = comfy_image_to_pil(image)
-    width, height = pil.size
-    arr = np.asarray(pil, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).to(comfy.model_management.get_torch_device())
-
-    with torch.no_grad():
-        out = moge.infer(tensor)
-
-    intrinsics = out["intrinsics"].squeeze().cpu().numpy()
-    fx_normalized = float(intrinsics[0, 0])
-    fx = fx_normalized * width
-    camera_angle_x = 2.0 * math.atan(width / (2.0 * fx))
-
+    Pairs with the ComfyUI-MoGe2 pack's `MoGe2Inference` node, which emits
+    `fov_x` in degrees. We convert to radians and run the same
+    _distance_from_fov math the legacy estimate_camera() used."""
+    camera_angle_x = math.radians(float(fov_x_deg))
     grid_point = torch.tensor([-1.0, 0.0, 0.0])
     distance = _distance_from_fov(
         camera_angle_x,
@@ -822,7 +802,7 @@ def _light_clean(tri, remove_inner_faces: bool = False):
     and returns the same trimesh."""
     import cumesh
     import trimesh as Trimesh
-    device = comfy.model_management.get_torch_device()
+    device = _mm().get_torch_device()
     verts = torch.tensor(tri.vertices, dtype=torch.float32, device=device).contiguous()
     faces = torch.tensor(tri.faces, dtype=torch.int32, device=device).contiguous()
 
@@ -879,7 +859,7 @@ def _query_vertex_pbr(tri, voxelgrid: dict) -> np.ndarray:
     """Trilinearly sample the sparse PBR voxel grid at each mesh vertex.
     Returns [N, C] numpy float in [0, 1]."""
     from flex_gemm_ap.ops.grid_sample import grid_sample_3d
-    device = comfy.model_management.get_torch_device()
+    device = _mm().get_torch_device()
     attrs = torch.from_numpy(voxelgrid["attrs"]).to(device)
     coords = torch.from_numpy(voxelgrid["coords"]).to(device)
     voxel_shape = voxelgrid["voxel_shape"]
@@ -983,7 +963,7 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device, debug=False):
 
     rast_face_ids = torch.full((S, S), -1, dtype=torch.int32, device=device)
     for i in range(0, faces.shape[0], chunk_size):
-        comfy.model_management.throw_exception_if_processing_interrupted()
+        _mm().throw_exception_if_processing_interrupted()
         chunk_vi = faces[i:i + chunk_size].int()
         index_img = drtk.rasterize(verts_uv, chunk_vi, height=S, width=S)
         chunk_hit = index_img[0] >= 0
@@ -1009,7 +989,7 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device, debug=False):
     # Keep rast_face_ids alive for caller if debug dump is on.
     rast_face_ids_out = rast_face_ids.clone() if debug else None
     del verts_uv, rast_face_ids, bary_img, bary, face_verts
-    comfy.model_management.soft_empty_cache()
+    _mm().soft_empty_cache()
     return mask, valid_pos, face_ids, bary_masked, rast_face_ids_out
 
 
@@ -1035,7 +1015,7 @@ def process_mesh(
     import cumesh as CuMesh
     import trimesh as Trimesh
 
-    device = comfy.model_management.get_torch_device()
+    device = _mm().get_torch_device()
     _dbg(f"process_mesh: in {len(tri.vertices)} verts / {len(tri.faces)} faces, target {target_face_count}")
     in_v = np.asarray(tri.vertices)
     _dbg(f"  vert bbox: min={in_v.min(axis=0).tolist()}, max={in_v.max(axis=0).tolist()}")
@@ -1073,7 +1053,7 @@ def process_mesh(
             cm.remove_small_connected_components(floater_threshold)
         _log_mesh_stats(f"after remove_small_cc({floater_threshold})", cm)
 
-    comfy.model_management.throw_exception_if_processing_interrupted()
+    _mm().throw_exception_if_processing_interrupted()
 
     if not remesh:
         # 2-pass simplify pattern from upstream to_glb.
@@ -1108,7 +1088,7 @@ def process_mesh(
             cm.simplify(target_face_count, verbose=True)
         _log_mesh_stats(f"after simplify({target_face_count})", cm)
 
-    comfy.model_management.throw_exception_if_processing_interrupted()
+    _mm().throw_exception_if_processing_interrupted()
 
     if weld_vertices:
         with _phase(f"process_mesh: weld_vertices(digits={weld_digits})"):
@@ -1161,7 +1141,7 @@ def process_mesh(
 
     del cm, out_v, out_f, out_uvs, out_vmaps
     gc.collect()
-    comfy.model_management.soft_empty_cache()
+    _mm().soft_empty_cache()
     return result
 
 
@@ -1200,7 +1180,7 @@ def rasterize_pbr(
     if "attrs" not in voxelgrid:
         raise ValueError("rasterize_pbr: voxelgrid dict is missing 'attrs'.")
 
-    device = comfy.model_management.get_torch_device()
+    device = _mm().get_torch_device()
     _dbg(
         f"rasterize_pbr: {len(tri.vertices)} verts / {len(tri.faces)} faces, "
         f"texture {texture_size}px, bake_mode={bake_mode}, "
@@ -1274,7 +1254,7 @@ def rasterize_pbr(
             valid_pos = (orig_tri_v * uvw.unsqueeze(-1)).sum(dim=1)
             del bvh, orig_v, orig_f, face_id, uvw, orig_tri_v
 
-    comfy.model_management.soft_empty_cache()
+    _mm().soft_empty_cache()
     mask_np = mask.cpu().numpy()
 
     # --------------------------------------------------------------------
@@ -1336,7 +1316,7 @@ def rasterize_pbr(
         log.info(f"[pixal3d] rasterize_pbr: {bake_mode} diagnostic texture baked ({texture_size}x{texture_size})")
         del attr_volume, coords, mask, valid_pos, face_ids, bary_masked
         gc.collect()
-        comfy.model_management.soft_empty_cache()
+        _mm().soft_empty_cache()
         return result
 
     # --------------------------------------------------------------------
@@ -1363,7 +1343,7 @@ def rasterize_pbr(
         )
 
     del valid_pos, valid_pos_yup, face_ids, bary_masked
-    comfy.model_management.soft_empty_cache()
+    _mm().soft_empty_cache()
 
     bc_slice = layout.get("base_color", slice(0, 3))
     me_slice = layout.get("metallic", slice(3, 4))
@@ -1382,7 +1362,7 @@ def rasterize_pbr(
 
     del attrs, mask, attr_volume, coords
     gc.collect()
-    comfy.model_management.soft_empty_cache()
+    _mm().soft_empty_cache()
 
     with _phase("rasterize_pbr: cv2.inpaint (UV seam pad)"):
         mask_inv = (~mask_np).astype(np.uint8)

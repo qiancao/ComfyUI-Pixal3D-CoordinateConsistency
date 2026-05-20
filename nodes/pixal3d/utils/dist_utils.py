@@ -5,7 +5,10 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-import comfy.model_management
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
 
 
 def setup_dist(rank, local_rank, world_size, master_addr, master_port):
@@ -28,18 +31,18 @@ def read_file_dist(path):
     """
     if dist.is_initialized() and dist.get_world_size() > 1:
         # read file
-        size = torch.LongTensor(1).to(comfy.model_management.get_torch_device())
+        size = torch.LongTensor(1).to(_mm().get_torch_device())
         if dist.get_rank() == 0:
             with open(path, 'rb') as f:
                 data = f.read()
             data = torch.ByteTensor(
                 torch.UntypedStorage.from_buffer(data, dtype=torch.uint8)
-            ).to(comfy.model_management.get_torch_device())
+            ).to(_mm().get_torch_device())
             size[0] = data.shape[0]
         # broadcast size
         dist.broadcast(size, src=0)
         if dist.get_rank() != 0:
-            data = torch.ByteTensor(size[0].item()).to(comfy.model_management.get_torch_device())
+            data = torch.ByteTensor(size[0].item()).to(_mm().get_torch_device())
         # broadcast data
         dist.broadcast(data, src=0)
         # convert to io.BytesIO

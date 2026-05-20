@@ -38,7 +38,7 @@ class Pixal3DGenerateMesh(io.ComfyNode):
             inputs=[
                 io.Custom("PIXAL3D_PIPELINE").Input("pipeline", tooltip="From Pixal3DLoadPipeline."),
                 io.Image.Input("image", tooltip="Preprocessed image."),
-                io.Custom("PIXAL3D_CAMERA").Input("camera", tooltip="From Pixal3DEstimateCamera."),
+                io.Custom("PIXAL3D_CAMERA").Input("camera", tooltip="From Pixal3DCameraFromFOV."),
                 io.Int.Input("seed", default=42, min=0, max=2**31 - 1),
                 io.Int.Input("max_num_tokens", default=49152, min=1024, max=131072, step=1024, optional=True),
                 io.Int.Input("ss_steps", default=12, min=1, max=64, optional=True),

@@ -42,21 +42,32 @@ class Pixal3DPreprocessImage(io.ComfyNode):
             return io.NodeOutput(out)
 
 
-class Pixal3DEstimateCamera(io.ComfyNode):
-    """Run MoGe-2 to infer camera_angle_x + distance from the preprocessed image."""
+class Pixal3DCameraFromFOV(io.ComfyNode):
+    """Pack an externally-measured horizontal FOV into a PIXAL3D_CAMERA dict.
+
+    Designed to consume `fov_x` (degrees) from the ComfyUI-MoGe2 pack's
+    `MoGe2Inference` node. Camera estimation is no longer in-process here -- we
+    let MoGe2 own model loading and just do the rad conversion + back-projection
+    distance math the cascade needs."""
 
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="Pixal3DEstimateCamera",
-            display_name="Pixal3D Estimate Camera",
+            node_id="Pixal3DCameraFromFOV",
+            display_name="Pixal3D Camera From FOV",
             category="Pixal3D",
             description=(
-                "Uses MoGe-2 (Ruicheng/moge-2-vitl, ~0.9 GB, downloaded on first run) "
-                "to estimate camera intrinsics and a default distance for back-projection."
+                "Converts horizontal FOV (degrees) into the PIXAL3D_CAMERA dict the "
+                "cascade expects (camera_angle_x in radians + back-projection distance "
+                "+ mesh scale). Wire the `fov_x` output of ComfyUI-MoGe2's "
+                "`MoGe2Inference` node into `fov_x_deg` here."
             ),
             inputs=[
-                io.Image.Input("image", tooltip="Preprocessed (square, 1024-max) image."),
+                io.Float.Input(
+                    "fov_x_deg",
+                    default=60.0, min=1.0, max=170.0, step=0.1,
+                    tooltip="Horizontal FOV in degrees. Wire from MoGe2Inference.fov_x.",
+                ),
                 io.Float.Input("mesh_scale", default=1.0, min=0.1, max=10.0, step=0.05, optional=True),
                 io.Int.Input("extend_pixel", default=0, min=0, max=128, optional=True),
                 io.Int.Input("image_resolution", default=512, min=256, max=2048, step=64, optional=True),
@@ -69,21 +80,22 @@ class Pixal3DEstimateCamera(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        image,
+        fov_x_deg: float,
         mesh_scale: float = 1.0,
         extend_pixel: int = 0,
         image_resolution: int = 512,
     ):
-        from .stages import estimate_camera, _phase
-        with _phase("Pixal3DEstimateCamera.execute"):
-            cam = estimate_camera(
-                image,
+        from .stages import pack_camera_from_fov, _phase
+        with _phase("Pixal3DCameraFromFOV.execute"):
+            cam = pack_camera_from_fov(
+                fov_x_deg=fov_x_deg,
                 mesh_scale=mesh_scale,
                 extend_pixel=extend_pixel,
                 image_resolution=image_resolution,
             )
             log.info(
-                f"[Pixal3DEstimateCamera] camera_angle_x={cam['camera_angle_x']:.4f}, "
+                f"[Pixal3DCameraFromFOV] fov_x_deg={fov_x_deg:.2f}, "
+                f"camera_angle_x={cam['camera_angle_x']:.4f}, "
                 f"distance={cam['distance']:.4f}, mesh_scale={cam['mesh_scale']:.4f}"
             )
             return io.NodeOutput(cam)
@@ -108,7 +120,7 @@ class Pixal3DGenerateGLB(io.ComfyNode):
             inputs=[
                 io.Custom("PIXAL3D_PIPELINE").Input("pipeline", tooltip="From Pixal3DLoadPipeline."),
                 io.Image.Input("image", tooltip="Preprocessed image."),
-                io.Custom("PIXAL3D_CAMERA").Input("camera", tooltip="From Pixal3DEstimateCamera."),
+                io.Custom("PIXAL3D_CAMERA").Input("camera", tooltip="From Pixal3DCameraFromFOV."),
                 io.Int.Input("seed", default=42, min=0, max=2**31 - 1),
                 io.Int.Input("max_num_tokens", default=49152, min=1024, max=131072, step=1024, optional=True),
                 # SS knobs
@@ -230,12 +242,12 @@ class Pixal3DGenerateGLB(io.ComfyNode):
 
 NODE_CLASS_MAPPINGS = {
     "Pixal3DPreprocessImage": Pixal3DPreprocessImage,
-    "Pixal3DEstimateCamera": Pixal3DEstimateCamera,
+    "Pixal3DCameraFromFOV": Pixal3DCameraFromFOV,
     "Pixal3DGenerateGLB": Pixal3DGenerateGLB,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Pixal3DPreprocessImage": "Pixal3D Preprocess Image",
-    "Pixal3DEstimateCamera": "Pixal3D Estimate Camera",
+    "Pixal3DCameraFromFOV": "Pixal3D Camera From FOV",
     "Pixal3DGenerateGLB": "Pixal3D Generate GLB",
 }
