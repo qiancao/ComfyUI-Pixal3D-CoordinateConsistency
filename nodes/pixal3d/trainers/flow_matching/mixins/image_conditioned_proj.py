@@ -18,8 +18,14 @@ from PIL import Image, ImageDraw
 import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
-import comfy.model_management
 import comfy.utils
+
+
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
+
 
 # `_torch_load` is an alias used ONLY where the checkpoint comes as a file-like
 # object from `read_file_dist(...)` -- comfy.utils.load_torch_file requires a
@@ -442,11 +448,11 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         return self
 
     def cuda(self):
-        super().to(comfy.model_management.get_torch_device())
-        self.model.to(comfy.model_management.get_torch_device())
-        self.proj_grid.to(comfy.model_management.get_torch_device())
+        super().to(_mm().get_torch_device())
+        self.model.to(_mm().get_torch_device())
+        self.proj_grid.to(_mm().get_torch_device())
         if self.naf_model is not None:
-            self.naf_model.to(comfy.model_management.get_torch_device())
+            self.naf_model.to(_mm().get_torch_device())
         return self
 
     def cpu(self):
@@ -503,7 +509,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).to(comfy.model_management.get_torch_device())
+            image = torch.stack(image).to(_mm().get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -703,11 +709,11 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
         return self
     
     def cuda(self):
-        super().to(comfy.model_management.get_torch_device())
-        self.dino_model.to(comfy.model_management.get_torch_device())
-        self.proj_grid.to(comfy.model_management.get_torch_device())
+        super().to(_mm().get_torch_device())
+        self.dino_model.to(_mm().get_torch_device())
+        self.proj_grid.to(_mm().get_torch_device())
         if self._vae is not None:
-            self._vae.to(comfy.model_management.get_torch_device())
+            self._vae.to(_mm().get_torch_device())
         return self
     
     def cpu(self):
@@ -766,7 +772,7 @@ class DinoV3VaeProjFeatureExtractor(nn.Module):
             image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
             image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
             image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).to(comfy.model_management.get_torch_device())
+            image = torch.stack(image).to(_mm().get_torch_device())
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
@@ -846,7 +852,7 @@ class ImageConditionedProjMixin:
                 from . import image_conditioned
                 self.image_cond_model = getattr(image_conditioned, model_name)(**model_args)
             
-            self.image_cond_model.to(comfy.model_management.get_torch_device())
+            self.image_cond_model.to(_mm().get_torch_device())
             
             # Expose proj_channels for denoiser to know the correct proj_in_channels
             if hasattr(self.image_cond_model, 'proj_channels'):

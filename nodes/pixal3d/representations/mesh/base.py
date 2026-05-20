@@ -3,7 +3,10 @@ import torch
 from ..voxel import Voxel
 import cumesh
 from flex_gemm.ops.grid_sample import grid_sample_3d
-import comfy.model_management
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
 
 
 class Mesh:
@@ -28,14 +31,14 @@ class Mesh:
         )
         
     def cuda(self, non_blocking=False):
-        return self.to(comfy.model_management.get_torch_device(), non_blocking=non_blocking)
+        return self.to(_mm().get_torch_device(), non_blocking=non_blocking)
         
     def cpu(self):
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
-        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
+        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -58,8 +61,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def remove_faces(self, face_mask: torch.Tensor):
-        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
-        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
+        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -70,8 +73,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
-        vertices = self.vertices.clone().to(comfy.model_management.get_torch_device()).contiguous()
-        faces = self.faces.clone().to(comfy.model_management.get_torch_device()).contiguous()
+        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
+        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)

@@ -4,7 +4,10 @@ import torch
 from ..modules import sparse as sp
 from ..representations import Voxel
 from .render_utils import render_video
-import comfy.model_management
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
 
 
 def pca_color(feats: torch.Tensor, channels: Tuple[int, int, int] = (0, 1, 2)) -> torch.Tensor:
@@ -25,8 +28,8 @@ def vis_sparse_tensor(
     assert x.shape[0] == 1, "Only support batch size 1"
     assert x.coords.shape[1] == 4, "Only support 3D coordinates"
     
-    coords = x.coords.to(comfy.model_management.get_torch_device()).detach()[:, 1:]
-    feats = x.feats.to(comfy.model_management.get_torch_device()).detach()
+    coords = x.coords.to(_mm().get_torch_device()).detach()[:, 1:]
+    feats = x.feats.to(_mm().get_torch_device()).detach()
     color = pca_color(feats)
     
     resolution = max(list(x.spatial_shape))

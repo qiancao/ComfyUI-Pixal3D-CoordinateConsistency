@@ -1,8 +1,13 @@
 from typing import *
 import torch
 import torch.nn as nn
-import comfy.model_management
 from .. import models
+
+
+def _mm():
+    """Lazy accessor for comfy.model_management (deferred to avoid eager CUDA init at import)."""
+    import comfy.model_management as _m
+    return _m
 
 
 class Pipeline:
@@ -67,7 +72,7 @@ class Pipeline:
             model.to(device)
 
     def cuda(self) -> None:
-        self.to(comfy.model_management.get_torch_device())
+        self.to(_mm().get_torch_device())
 
     def cpu(self) -> None:
         self.to(torch.device("cpu"))
