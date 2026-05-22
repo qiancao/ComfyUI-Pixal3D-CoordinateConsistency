@@ -1,22 +1,7 @@
-# cuda-wheels variant aliases — pixal3d code imports bare `cumesh` / `o_voxel` / `flex_gemm`,
-# but the wrapper installs the *_vb / *_vb_ap / *_ap forks. Install aliases on first import.
-import sys as _sys
-
-for _real, _aliases in [
-    ("cumesh_vb", ["cumesh"]),
-    ("o_voxel_vb_ap", ["o_voxel"]),
-    ("flex_gemm_ap", ["flex_gemm"]),
-]:
-    if _real in _sys.modules:
-        _mod = _sys.modules[_real]
-    else:
-        try:
-            _mod = __import__(_real)
-        except ImportError:
-            continue
-    for _alias in _aliases:
-        _sys.modules.setdefault(_alias, _mod)
-del _sys
+# Pixal3D submodules now import the wheel names directly (cumesh_vb,
+# o_voxel_vb_ap, flex_gemm_ap) -- matching TRELLIS2's pattern. The previous
+# sys.modules alias hack here was removed; it silently swallowed ImportError
+# and masked real failures.
 
 from . import models
 from . import modules

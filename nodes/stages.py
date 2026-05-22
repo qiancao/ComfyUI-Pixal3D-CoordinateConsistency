@@ -868,14 +868,14 @@ def _light_clean(tri, remove_inner_faces: bool = False):
     """In-place cumesh cleanup: dedup + repair_non_manifold + unify_face_orientations,
     plus optional BVH-raystab inner-face removal. Updates tri.vertices / tri.faces
     and returns the same trimesh."""
-    import cumesh
+    import cumesh_vb
     import trimesh as Trimesh
     device = _mm().get_torch_device()
     verts = torch.tensor(tri.vertices, dtype=torch.float32, device=device).contiguous()
     faces = torch.tensor(tri.faces, dtype=torch.int32, device=device).contiguous()
 
     with _phase("light_clean: dedup + repair + unify"):
-        cm = cumesh.CuMesh()
+        cm = cumesh_vb.CuMesh()
         cm.init(verts, faces)
         cm.remove_duplicate_faces()
         cm.repair_non_manifold_edges()
@@ -895,7 +895,7 @@ def _light_clean(tri, remove_inner_faces: bool = False):
             bbox_diag = float((v.amax(0) - v.amin(0)).norm())
             eps = bbox_diag * 1e-3
             test_pts = face_centers + face_normals * eps
-            bvh = cumesh.cuBVH(v, f)
+            bvh = cumesh_vb.cuBVH(v, f)
             sdf_chunk = 524_288
             sdf = torch.empty(test_pts.shape[0], dtype=torch.float32, device=device)
             for i in range(0, test_pts.shape[0], sdf_chunk):
@@ -1080,7 +1080,7 @@ def process_mesh(
 ):
     """Heavy mesh cleanup + UV unwrap. Port of TRELLIS2 Trellis2ProcessMesh.execute().
     Returns a trimesh.Trimesh with .visual.uv set and vertex_normals populated."""
-    import cumesh as CuMesh
+    import cumesh_vb
     import trimesh as Trimesh
 
     device = _mm().get_torch_device()
@@ -1092,7 +1092,7 @@ def process_mesh(
     faces = torch.tensor(tri.faces, dtype=torch.int32, device=device)
 
     with _phase("process_mesh: cumesh.init"):
-        cm = CuMesh.CuMesh()
+        cm = cumesh_vb.CuMesh()
         cm.init(verts, faces)
         del verts, faces
     _log_mesh_stats("after init", cm)
@@ -1103,7 +1103,7 @@ def process_mesh(
             aabb = torch.tensor([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], device=device)
             center = aabb.mean(dim=0)
             scale = (aabb[1] - aabb[0]).max().item()
-            cm.init(*CuMesh.remeshing.remesh_narrow_band_dc_quad(
+            cm.init(*cumesh_vb.remeshing.remesh_narrow_band_dc_quad(
                 curr_v, curr_f,
                 center=center,
                 scale=scale * 1.1,
@@ -1239,7 +1239,7 @@ def rasterize_pbr(
                 files to ComfyUI/output/ (prefixed pixal3d_debug_<ts>_). Use to
                 inspect chart layout / mesh state when textures look wrong."""
     import cv2
-    import cumesh as CuMesh
+    import cumesh_vb
     from flex_gemm_ap.ops.grid_sample import grid_sample_3d
     import trimesh as Trimesh
 
@@ -1316,7 +1316,7 @@ def rasterize_pbr(
         with _phase("rasterize_pbr: BVH-snap texels to original mesh"):
             orig_v = torch.tensor(original_mesh.vertices, dtype=torch.float32, device=device)
             orig_f = torch.tensor(original_mesh.faces, dtype=torch.int32, device=device)
-            bvh = CuMesh.cuBVH(orig_v, orig_f)
+            bvh = cumesh_vb.cuBVH(orig_v, orig_f)
             _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
             orig_tri_v = orig_v[orig_f[face_id.long()]]
             valid_pos = (orig_tri_v * uvw.unsqueeze(-1)).sum(dim=1)
