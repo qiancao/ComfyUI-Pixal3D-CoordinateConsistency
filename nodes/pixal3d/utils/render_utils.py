@@ -23,18 +23,29 @@ def yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitchs, rs, fovs):
         rs = [rs] * len(yaws)
     if not isinstance(fovs, list):
         fovs = [fovs] * len(yaws)
+
+    device = _mm().get_torch_device()
+    # Batch all per-camera scalars onto the device in one transfer each
+    # (was: 6 .to(device) calls per camera = 6N kernel launches).
+    yaws_t = torch.tensor([float(y) for y in yaws], device=device)
+    pitchs_t = torch.tensor([float(p) for p in pitchs], device=device)
+    rs_t = torch.tensor([float(r) for r in rs], device=device)
+    fovs_rad = torch.deg2rad(torch.tensor([float(f) for f in fovs], device=device))
+    look_at_target = torch.zeros(3, device=device)
+    look_at_up = torch.tensor([0., 0., 1.], device=device)
+
     extrinsics = []
     intrinsics = []
-    for yaw, pitch, r, fov in zip(yaws, pitchs, rs, fovs):
-        fov = torch.deg2rad(torch.tensor(float(fov))).to(_mm().get_torch_device())
-        yaw = torch.tensor(float(yaw)).to(_mm().get_torch_device())
-        pitch = torch.tensor(float(pitch)).to(_mm().get_torch_device())
-        orig = torch.tensor([
+    for i in range(len(yaws_t)):
+        yaw = yaws_t[i]
+        pitch = pitchs_t[i]
+        orig = torch.stack([
             torch.sin(yaw) * torch.cos(pitch),
             torch.cos(yaw) * torch.cos(pitch),
             torch.sin(pitch),
-        ]).to(_mm().get_torch_device()) * r
-        extr = utils3d.torch.extrinsics_look_at(orig, torch.tensor([0, 0, 0]).float().to(_mm().get_torch_device()), torch.tensor([0, 0, 1]).float().to(_mm().get_torch_device()))
+        ]) * rs_t[i]
+        fov = fovs_rad[i]
+        extr = utils3d.torch.extrinsics_look_at(orig, look_at_target, look_at_up)
         intr = utils3d.torch.intrinsics_from_fov_xy(fov, fov)
         extrinsics.append(extr)
         intrinsics.append(intr)

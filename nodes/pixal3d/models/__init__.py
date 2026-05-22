@@ -46,7 +46,7 @@ def from_pretrained(path: str, **kwargs):
     """
     import os
     import json
-    from safetensors.torch import load_file
+    import comfy.utils
     is_local = os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors")
 
     if is_local:
@@ -63,7 +63,8 @@ def from_pretrained(path: str, **kwargs):
     with open(config_file, 'r') as f:
         config = json.load(f)
     model = __getattr__(config['name'])(**config['args'], **kwargs)
-    model.load_state_dict(load_file(model_file), strict=False)
+    state_dict = comfy.utils.load_torch_file(model_file, safe_load=True)
+    model.load_state_dict(state_dict, strict=False)
 
     return model
 

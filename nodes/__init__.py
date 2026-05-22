@@ -1,23 +1,10 @@
 """ComfyUI-Pixal3D nodes — aggregated NODE_CLASS_MAPPINGS for register_nodes()."""
 
-# --- cuda-wheels variant aliases ------------------------------------------------
-# We use the _vb_ap / _ap variants from cuda-wheels (nvdiffrast-free, MIT-aligned).
-# The vendored pixal3d code (and our stages.py) imports the bare module names.
-# Install sys.modules aliases BEFORE any pixal3d / stages import.
-import sys as _sys
-
-for _real, _aliases in [
-    ("cumesh_vb", ["cumesh"]),
-    ("o_voxel_vb_ap", ["o_voxel"]),
-    ("flex_gemm_ap", ["flex_gemm"]),
-]:
-    try:
-        _mod = __import__(_real)
-        for _alias in _aliases:
-            _sys.modules[_alias] = _mod
-    except ImportError:
-        pass
-del _sys, _real, _aliases, _mod, _alias
+# Note: pixal3d code now imports the installed wheel names directly --
+# `cumesh_vb`, `o_voxel_vb_ap`, `flex_gemm_ap` (matching TRELLIS2's pattern).
+# A previous sys.modules alias hack here aliased the bare names; that turned
+# out to silently swallow ImportError and mask real failures, so it was
+# removed and every call site was renamed to use the wheel names explicitly.
 
 from .nodes_loader import (
     NODE_CLASS_MAPPINGS as loader_mappings,
