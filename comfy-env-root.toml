@@ -1,5 +1,2 @@
-[cuda]
-packages = ['flash-attn', 'sageattention']
-
 [node_reqs]
 ComfyUI-MoGe2 = "PozzettiAndrea/ComfyUI-MoGe2"

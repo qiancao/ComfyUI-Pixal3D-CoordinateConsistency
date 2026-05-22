@@ -87,6 +87,10 @@ def _comfy_tqdm():
 
     class _T(_tqdm_mod.tqdm):
         def __init__(self, *a, **kw):
+            # Throttle terminal refresh: at most 1 line/5 s, at least 1 line/60 s.
+            # ComfyUI ProgressBar.update_absolute still fires on every .update(n).
+            kw.setdefault('mininterval', 5.0)
+            kw.setdefault('maxinterval', 60.0)
             super().__init__(*a, **kw)
             if self.total and self.total > 0 and holder["pbar"] is None:
                 holder["total"] = self.total
@@ -584,24 +588,27 @@ def _build_cond(key: str):
     model = DinoV3ProjFeatureExtractor(**IMAGE_COND_CONFIGS[key])
     model.eval()
 
-    # First cond captures the backbone; subsequent conds throw away their
-    # freshly-built backbone in favour of the shared one.
+    # First cond builds the backbone via our vendored plain nn.Module
+    # (DINOv3ViT with state-dict keys matching the HF checkpoint exactly).
+    # We DO let DinoV3ProjFeatureExtractor.__init__ construct its own HF
+    # backbone above (it's needed because the constructor reads
+    # self.model.config.patch_size etc. before we get here) -- we then
+    # discard it. Negligible cost (~350 MB allocated then GC'd once at
+    # init_pipeline; not per-call).
     if _shared_dinov3 is None:
-        _shared_dinov3 = model.model
+        from .pixal3d.modules.dinov3_vendored import DinoV3ViT_from_hf_cache
+        _shared_dinov3 = DinoV3ViT_from_hf_cache(IMAGE_COND_CONFIGS[key]["model_name"])
 
-    # Detach DINOv3 from this extractor's _modules (so its ModelPatcher won't
-    # try to move backbone weights) and rebind via __dict__ (so the forward
-    # path's `self.model(...)` still resolves).
+    # Detach the freshly-built transformers backbone from this extractor's
+    # _modules and rebind `self.model` to our vendored plain nn.Module via
+    # __dict__. ModelPatcher then manages `_shared_dinov3` exclusively (see
+    # _wrap_pipeline_models_with_patchers); cond extractors only hold a
+    # reference. Critical: DINOv3ViT has a settable `.device` attribute
+    # (unlike transformers.DINOv3ViTModel's read-only @property) so
+    # ComfyUI's load_models_gpu doesn't crash.
     if "model" in model._modules:
         del model._modules["model"]
     model.__dict__["model"] = _shared_dinov3
-
-    # transformers >=5.0 moved DINOv3's transformer-layer ModuleList from
-    # `DINOv3ViTModel.layer` to `DINOv3ViTModel.model.layer`. Pixal3D's
-    # extract_features iterates `self.model.layer` directly — alias it back.
-    inner = _shared_dinov3
-    if not hasattr(inner, "layer") and hasattr(inner, "model") and hasattr(inner.model, "layer"):
-        inner.layer = inner.model.layer
     return model
 
 
