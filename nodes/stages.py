@@ -187,7 +187,17 @@ _pipeline = None
 # manager (load_models_gpu auto-offloads competing models in the workflow).
 _model_patchers: dict = {}
 # One nn.Module reused by all 3 cond extractors that need NAF upsampling.
+# Wrapped in `_naf_patcher` so ComfyUI's memory manager tracks it; cond
+# extractors co-load it via `also_load=` (see _wrap_pipeline_models_with_patchers).
 _naf = None
+_naf_patcher = None
+# Shared DINOv3 backbone across all 4 cond extractors (configs differ in
+# image_size/grid_resolution/NAF target but not in backbone weights).
+# Detached from each extractor's _modules and rebound via __dict__ so a single
+# ModelPatcher (_dinov3_patcher) manages it -- otherwise 4 cond patchers would
+# all try to manage the same weights. ~350 MB freed per redundant copy.
+_shared_dinov3 = None
+_dinov3_patcher = None
 
 
 # ============================================================================
@@ -361,7 +371,7 @@ def _set_attention_backends(backend: str):
     log.info(f"[attn] dense + sparse backend = {resolved} (requested: {backend})")
 
 
-def _wrap_with_comfy_patcher(model):
+def _wrap_with_comfy_patcher(model, also_load=()):
     """Wrap an nn.Module in a ComfyUI ModelPatcher and reroute its `.to()` / `.cpu()`
     so pixal3d's per-stage swap goes through `load_models_gpu` / `unpatch_model`.
 
@@ -412,7 +422,9 @@ def _wrap_with_comfy_patcher(model):
             _reentry.inside = True
             try:
                 # Inform ComfyUI's memory manager (auto-offloads competing models).
-                _mm().load_models_gpu([patcher])
+                # `also_load` co-loads any sibling patchers that share weights with
+                # this model (e.g. cond extractors share a single DINOv3 backbone).
+                _mm().load_models_gpu([patcher, *also_load])
                 # ComfyUI's ModelPatcher.load doesn't always physically relocate
                 # the wrapped module -- it manages cast/lowvram patches for its
                 # own forward path. Pixal3D accesses .weight directly, so we
@@ -443,11 +455,24 @@ def _wrap_with_comfy_patcher(model):
 
 def _wrap_pipeline_models_with_patchers(pipeline):
     """Wrap every nn.Module the cascade swaps in/out: 8 cascade models +
-    4 DinoV3 cond models + rembg. All start on CPU; load_models_gpu moves
-    them to GPU on first `.to(device)` and offloads on `.cpu()`."""
+    4 DinoV3 cond models + the shared DINOv3 backbone. All start on CPU;
+    load_models_gpu moves them to GPU on first `.to(device)` and offloads on
+    `.cpu()`. Cond extractors co-load the shared backbone via `also_load=`."""
+    global _dinov3_patcher, _naf_patcher
     for key, m in pipeline.models.items():
         _wrap_with_comfy_patcher(m)
         log.info(f"[patcher] wrapped pipeline.models['{key}']")
+    # Wrap shared backbones FIRST so cond extractors can reference their
+    # patchers in `also_load=` (single load_models_gpu call moves cond + both
+    # shared backbones together; cond extractor's own .to()/.cpu() overrides
+    # then re-enter the shared patchers' .to/.cpu, keeping bookkeeping aligned).
+    if _shared_dinov3 is not None and _dinov3_patcher is None:
+        _dinov3_patcher = _wrap_with_comfy_patcher(_shared_dinov3)
+        log.info("[patcher] wrapped shared DINOv3 backbone")
+    if _naf is not None and _naf_patcher is None:
+        _naf_patcher = _wrap_with_comfy_patcher(_naf)
+        log.info("[patcher] wrapped shared NAF backbone")
+    cond_also_load = [p for p in (_dinov3_patcher, _naf_patcher) if p is not None]
     for attr in (
         "image_cond_model_ss",
         "image_cond_model_shape_512",
@@ -456,7 +481,7 @@ def _wrap_pipeline_models_with_patchers(pipeline):
     ):
         m = getattr(pipeline, attr, None)
         if m is not None:
-            _wrap_with_comfy_patcher(m)
+            _wrap_with_comfy_patcher(m, also_load=cond_also_load)
             log.info(f"[patcher] wrapped pipeline.{attr}")
     # NOTE: pipeline.rembg_model is intentionally NOT wrapped. We never call it
     # (pipeline.run(preprocess_image=False) bypasses its preprocess_image), and
@@ -511,9 +536,13 @@ def init_pipeline(attn_backend: str = "auto") -> "object":
         # subsequent `image_cond_model.to(self.device)` is .to('cpu') -- a no-op.
         # The conv2d then fails with cuda-input vs cpu-weight.
         pipeline.to(_mm().get_torch_device())
-        with _phase("ModelPatcher wrap: 13 models"):
-            _wrap_pipeline_models_with_patchers(pipeline)
 
+        # NAF must be built BEFORE the patcher wrap so `_wrap_pipeline_models_with_patchers`
+        # can register `_naf_patcher` and feed it into the cond extractors' `also_load=`
+        # (alongside `_dinov3_patcher`). Without this ordering, the first cond extractor's
+        # patched `.to()` would call `load_models_gpu` without NAF in the load set, the
+        # cond's own `.to()` override would then physically move NAF (re-entering NAF's
+        # patched `.to`), and ComfyUI's bookkeeping for NAF would drift.
         with _phase("NAF: build singleton + attach to 3 cond models"):
             for attr in (
                 "image_cond_model_ss",
@@ -525,20 +554,52 @@ def init_pipeline(attn_backend: str = "auto") -> "object":
                 if m is not None and getattr(m, "use_naf_upsample", False):
                     m._load_naf()
 
+        with _phase("ModelPatcher wrap: cascade + cond + shared backbones"):
+            _wrap_pipeline_models_with_patchers(pipeline)
+
     _pipeline = pipeline
     return pipeline
 
 
 def _build_cond(key: str):
+    """Build a DinoV3 cond extractor for stage `key`.
+
+    All 4 stage configs share the same DINOV3_REPO backbone but differ in
+    image_size / grid_resolution / NAF target. The cond extractor's __init__
+    unconditionally calls DINOv3ViTModel.from_pretrained, so the first call
+    captures the resulting backbone as `_shared_dinov3` and subsequent calls
+    swap their freshly-built (redundant) backbone for the shared one. We
+    detach the backbone from each extractor's _modules and rebind via
+    __dict__ so the 4 ModelPatchers don't all try to manage the same weights
+    (same approach the existing NAF wiring uses).
+
+    The shared backbone is wrapped in its own _dinov3_patcher and routed
+    through load_models_gpu alongside whichever cond extractor is active
+    (see also_load= in _wrap_pipeline_models_with_patchers).
+    """
+    global _shared_dinov3
     from .pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import (
         DinoV3ProjFeatureExtractor,
     )
     model = DinoV3ProjFeatureExtractor(**IMAGE_COND_CONFIGS[key])
     model.eval()
+
+    # First cond captures the backbone; subsequent conds throw away their
+    # freshly-built backbone in favour of the shared one.
+    if _shared_dinov3 is None:
+        _shared_dinov3 = model.model
+
+    # Detach DINOv3 from this extractor's _modules (so its ModelPatcher won't
+    # try to move backbone weights) and rebind via __dict__ (so the forward
+    # path's `self.model(...)` still resolves).
+    if "model" in model._modules:
+        del model._modules["model"]
+    model.__dict__["model"] = _shared_dinov3
+
     # transformers >=5.0 moved DINOv3's transformer-layer ModuleList from
     # `DINOv3ViTModel.layer` to `DINOv3ViTModel.model.layer`. Pixal3D's
     # extract_features iterates `self.model.layer` directly — alias it back.
-    inner = model.model
+    inner = _shared_dinov3
     if not hasattr(inner, "layer") and hasattr(inner, "model") and hasattr(inner.model, "layer"):
         inner.layer = inner.model.layer
     return model

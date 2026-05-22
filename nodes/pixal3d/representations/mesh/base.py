@@ -37,8 +37,8 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
-        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
+        vertices = self.vertices.to(_mm().get_torch_device(), non_blocking=True).contiguous()
+        faces = self.faces.to(_mm().get_torch_device(), non_blocking=True).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -61,8 +61,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def remove_faces(self, face_mask: torch.Tensor):
-        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
-        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
+        vertices = self.vertices.to(_mm().get_torch_device(), non_blocking=True).contiguous()
+        faces = self.faces.to(_mm().get_torch_device(), non_blocking=True).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
@@ -73,8 +73,8 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
-        vertices = self.vertices.clone().to(_mm().get_torch_device()).contiguous()
-        faces = self.faces.clone().to(_mm().get_torch_device()).contiguous()
+        vertices = self.vertices.to(_mm().get_torch_device(), non_blocking=True).contiguous()
+        faces = self.faces.to(_mm().get_torch_device(), non_blocking=True).contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
