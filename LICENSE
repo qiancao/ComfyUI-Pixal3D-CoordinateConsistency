@@ -19,21 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-NOTE: This MIT license covers the ComfyUI wrapper code in this repository only.
-
-The Pixal3D model weights (downloaded at runtime from huggingface.co/TencentARC/Pixal3D)
-are subject to a SEPARATE academic-only license from Tencent. From Tencent's LICENSE:
-
-  "You agree to use the Pixal3D only for academic purposes, and refrain from
-  using it for any commercial or production purposes under any circumstances."
-
-  "Pixal3D IS NOT INTENDED FOR USE WITHIN THE EUROPEAN UNION. IN THE EVENT OF
-  ANY CONFLICT, THIS CLAUSE SHALL PREVAIL."
-
-The DinoV3 image encoder weights (Meta) require "Built with DINOv3" attribution.
-
-Users of this node pack are responsible for complying with all upstream model
-licenses. See README.md for details.
