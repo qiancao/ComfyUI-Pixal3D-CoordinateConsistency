@@ -2,7 +2,9 @@
 
 import logging
 
+import numpy as np
 import torch
+import trimesh
 from comfy_api.latest import io
 
 log = logging.getLogger("pixal3d")
@@ -38,8 +40,121 @@ class Pixal3DPreprocessImage(io.ComfyNode):
     def execute(cls, image, mask=None):
         from .stages import preprocess_image, _phase
         with _phase("Pixal3DPreprocessImage.execute"):
-            out = preprocess_image(image, mask=mask)
-            return io.NodeOutput(out)
+            out, transform = preprocess_image(image, mask=mask)
+            return io.NodeOutput(image=out, transform=transform)
+
+
+class Pixal3DCoordinateTracker(io.ComfyNode):
+    """Pass-through for coordinate transform data."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Pixal3DCoordinateTracker",
+            display_name="Pixal3D Coordinate Tracker",
+            category="Pixal3D",
+            description="Tracks coordinate transformation data across the workflow.",
+            inputs=[
+                io.Custom("PIXAL3D_TRANSFORM").Input("transform"),
+            ],
+            outputs=[
+                io.Custom("PIXAL3D_TRANSFORM").Output(display_name="transform"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, transform):
+        return io.NodeOutput(transform=transform)
+
+
+class Pixal3DInverseTransform(io.ComfyNode):
+    """Inverts the centering transform to restore global coordinates."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Pixal3DInverseTransform",
+            display_name="Pixal3D Inverse Transform",
+            category="Pixal3D",
+            description="Inverts the preprocessing centering to restore original coordinates.",
+            inputs=[
+                io.Custom("TRIMESH").Input("mesh"),
+                io.Custom("PIXAL3D_CAMERA").Input("camera"),
+                io.Custom("PIXAL3D_TRANSFORM").Input("transform"),
+            ],
+            outputs=[
+                io.Custom("TRIMESH").Output(display_name="mesh"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, mesh, camera, transform):
+        import math
+        
+        # 1. Get focal length in pixels
+        fov_x = camera.get("camera_angle_x", math.radians(60.0))
+        res = camera.get("image_resolution", 512)
+        f = (16.0 / math.tan(fov_x / 2.0)) * (res / 32.0)
+
+        # 2. Get transform params
+        scale = transform.get("scale", 1.0)
+        cx = transform.get("cx", 0.0)
+        cy = transform.get("cy", 0.0)
+
+        # 3. Calculate global pixel offsets
+        delta_u = cx / scale
+        delta_v = cy / scale
+
+        # 4. Transform vertices
+        verts = np.array(mesh.vertices, dtype=np.float32)
+        
+        # Step A: Global scale (invert downscale)
+        verts = verts * (1.0 / scale)
+        
+        # Step B: Perspective shift
+        # For each vertex (x, y, z), we shift x and y based on its depth z
+        # Note: In the internal Pixal3D frame, Z is often the depth axis.
+        z_depths = verts[:, 2][:, np.newaxis]
+        verts[:, 0] += (delta_u * z_depths) / f
+        verts[:, 1] += (delta_v * z_depths) / f
+
+        # Create new mesh with transformed vertices
+        new_mesh = trimesh.Trimesh(
+            vertices=verts,
+            faces=mesh.faces,
+            process=False
+        )
+        if hasattr(mesh, "visual") and mesh.visual is not None:
+            new_mesh.visual = mesh.visual
+
+        return io.NodeOutput(mesh=new_mesh)
+
+
+class Pixal3DMeshAssembler(io.ComfyNode):
+    """Merges multiple meshes into one."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Pixal3DMeshAssembler",
+            display_name="Pixal3D Mesh Assembler",
+            category="Pixal3D",
+            description="Merges multiple meshes into a single unified mesh.",
+            inputs=[
+                io.Custom("TRIMESH").Input("meshes", is_list=True),
+            ],
+            outputs=[
+                io.Custom("TRIMESH").Output(display_name="mesh"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, meshes):
+        if not meshes:
+            raise ValueError("No meshes provided to assembler.")
+        
+        merged = trimesh.util.concatenate(meshes)
+        return io.NodeOutput(mesh=merged)
 
 
 class Pixal3DCameraFromFOV(io.ComfyNode):
@@ -242,12 +357,18 @@ class Pixal3DGenerateGLB(io.ComfyNode):
 
 NODE_CLASS_MAPPINGS = {
     "Pixal3DPreprocessImage": Pixal3DPreprocessImage,
+    "Pixal3DCoordinateTracker": Pixal3DCoordinateTracker,
+    "Pixal3DInverseTransform": Pixal3DInverseTransform,
+    "Pixal3DMeshAssembler": Pixal3DMeshAssembler,
     "Pixal3DCameraFromFOV": Pixal3DCameraFromFOV,
     "Pixal3DGenerateGLB": Pixal3DGenerateGLB,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Pixal3DPreprocessImage": "Pixal3D Preprocess Image",
+    "Pixal3DCoordinateTracker": "Pixal3D Coordinate Tracker",
+    "Pixal3DInverseTransform": "Pixal3D Inverse Transform",
+    "Pixal3DMeshAssembler": "Pixal3D Mesh Assembler",
     "Pixal3DCameraFromFOV": "Pixal3D Camera From FOV",
     "Pixal3DGenerateGLB": "Pixal3D Generate GLB",
 }

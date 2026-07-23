@@ -638,7 +638,7 @@ def preprocess_image(
     image: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
     bg_color=(0, 0, 0),
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, dict]:
     """Pure-PIL preprocess: alpha bbox crop + 1024-max resize + bg fill.
 
     Mirrors `pixal3d.pipelines.pixal3d_image_to_3d.Pixal3DImageTo3DPipeline.preprocess_image`
@@ -677,15 +677,17 @@ def preprocess_image(
             pil_alpha = pil_alpha.resize(pil_rgb.size, Image.Resampling.NEAREST)
 
     # Downscale longest side to 1024 (same as upstream pixal3d preprocess_image).
-    max_size = max(pil_rgb.size)
+    orig_w, orig_h = pil_rgb.size
+    max_size = max(orig_w, orig_h)
     scale = min(1.0, 1024 / max_size)
     if scale < 1.0:
-        new_size = (int(pil_rgb.width * scale), int(pil_rgb.height * scale))
+        new_size = (int(orig_w * scale), int(orig_h * scale))
         pil_rgb = pil_rgb.resize(new_size, Image.Resampling.LANCZOS)
         if pil_alpha is not None:
             pil_alpha = pil_alpha.resize(new_size, Image.Resampling.LANCZOS)
 
     # If we have a meaningful mask (not all-white), crop to alpha bbox.
+    cx, cy, side = 0.0, 0.0, 0.0
     if pil_alpha is not None:
         a = np.asarray(pil_alpha)
         if not np.all(a >= int(0.8 * 255)):
@@ -712,7 +714,14 @@ def preprocess_image(
                 pil_rgb = Image.fromarray((np.clip(composed, 0, 1) * 255).astype(np.uint8))
 
     out_t = torch.from_numpy(np.asarray(pil_rgb.convert("RGB"), dtype=np.float32) / 255.0).unsqueeze(0)
-    return out_t
+    transform_data = {
+        "cx": float(cx),
+        "cy": float(cy),
+        "side": float(side),
+        "scale": float(scale),
+        "orig_size": (orig_w, orig_h),
+    }
+    return out_t, transform_data
 
 
 # ============================================================================
